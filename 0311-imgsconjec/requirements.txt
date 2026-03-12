@@ -1,0 +1,5 @@
+numpy>=1.26
+opencv-python>=4.10
+streamlit>=1.42
+torch>=2.2
+kornia>=0.7.4
