@@ -6,6 +6,7 @@ import streamlit as st
 
 from dental_stitcher.stitching import OralStitcher
 from dental_stitcher.enhanced_stitching import CompatibleImprovedStitcher
+from dental_stitcher.v3_stitching import CompatibleV3Stitcher
 from dental_stitcher.utils import (
     arch_display_name,
     bgr_to_rgb,
@@ -37,8 +38,8 @@ def main() -> None:
         # 添加算法选择选项
         algorithm = st.selectbox(
             "拼接算法",
-            ["改进算法（推荐）", "原始算法"],
-            help="改进算法提供更好的光照融合和几何校正效果"
+            ["第三版算法（推荐）", "改进算法", "原始算法"],
+            help="第三版算法对视角变化与轻微形变更稳健"
         )
 
         # 添加可视化模式选项
@@ -71,7 +72,8 @@ def main() -> None:
         return
 
     # 根据选择创建不同的拼接器
-    use_improved = algorithm == "改进算法（推荐）"
+    use_v3 = algorithm == "第三版算法（推荐）"
+    use_improved = algorithm == "改进算法"
 
     # 可视化模式映射
     viz_mode_mapping = {
@@ -82,7 +84,9 @@ def main() -> None:
         "重叠区域": "重叠区域"
     }
 
-    if use_improved:
+    if use_v3:
+        stitcher = CompatibleV3Stitcher(viz_mode=viz_mode_mapping[viz_mode])
+    elif use_improved:
         stitcher = CompatibleImprovedStitcher(viz_mode=viz_mode_mapping[viz_mode])
     else:
         stitcher = OralStitcher()

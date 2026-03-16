@@ -1,0 +1,104 @@
+{
+  "pipeline_version": "v1",
+  "segmentation": {
+    "success": true,
+    "details": {
+      "method": "alphadent",
+      "count": 4
+    },
+    "fallback_reason": null
+  },
+  "features": {
+    "success": true,
+    "details": {
+      "method": "orb"
+    },
+    "fallback_reason": null
+  },
+  "registration": {
+    "success": true,
+    "details": {
+      "method": "homography",
+      "inliers": 11,
+      "inlier_ratio": 0.786,
+      "reprojection_error": 0.128
+    },
+    "fallback_reason": null
+  },
+  "blending": {
+    "success": true,
+    "details": {
+      "method": "feather"
+    },
+    "fallback_reason": null
+  },
+  "metrics": {
+    "inputs": [
+      {
+        "sharpness": 57.40415573120117,
+        "exposure": 0.2861762088595171
+      },
+      {
+        "sharpness": 96.22158813476562,
+        "exposure": 0.39591714104996834
+      },
+      {
+        "sharpness": 119.68990325927734,
+        "exposure": 0.530975571986303
+      },
+      {
+        "sharpness": 65.63501739501953,
+        "exposure": 0.23475139406893641
+      }
+    ]
+  },
+  "per_image": [
+    {
+      "index": 0,
+      "sharpness": 57.40415573120117,
+      "exposure": 0.2861762088595171,
+      "mask_coverage": 0.022951427512050426,
+      "segmentation_method": "alphadent",
+      "segmentation_fallback": null
+    },
+    {
+      "index": 1,
+      "sharpness": 96.22158813476562,
+      "exposure": 0.39591714104996834,
+      "mask_coverage": 1.0,
+      "segmentation_method": "full",
+      "segmentation_fallback": "segmentation_failed"
+    },
+    {
+      "index": 2,
+      "sharpness": 119.68990325927734,
+      "exposure": 0.530975571986303,
+      "mask_coverage": 0.015605302187615869,
+      "segmentation_method": "alphadent",
+      "segmentation_fallback": null
+    },
+    {
+      "index": 3,
+      "sharpness": 65.63501739501953,
+      "exposure": 0.23475139406893641,
+      "mask_coverage": 0.019025769373377827,
+      "segmentation_method": "alphadent",
+      "segmentation_fallback": null
+    }
+  ],
+  "per_pair": [
+    {
+      "pair": [
+        0,
+        1
+      ],
+      "matches": 14,
+      "inliers": 11,
+      "inlier_ratio": 0.786,
+      "reprojection_error": 0.128
+    }
+  ],
+  "logs": [
+    "Loaded 4 images."
+  ]
+}
