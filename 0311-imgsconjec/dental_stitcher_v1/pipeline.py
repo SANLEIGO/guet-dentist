@@ -29,7 +29,6 @@ PIPELINE_VERSION = "v1"
 def run_pipeline(
     images: list[np.ndarray],
     feature_method: str = "orb",
-    use_deep_segmentation: bool = False,
 ) -> StitchOutputs:
     logs: list[str] = []
 
@@ -57,7 +56,7 @@ def run_pipeline(
     seg_results = []
     per_image = []
     for idx, img in enumerate(normalized):
-        seg_result = segment_teeth(img, use_deep=use_deep_segmentation)
+        seg_result = segment_teeth(img)
         if cv2.countNonZero(seg_result.mask) == 0:
             seg_result = fallback_full_mask(img)
         seg_results.append(seg_result)
