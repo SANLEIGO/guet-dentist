@@ -22,20 +22,9 @@ def load_uploaded_images(files: Iterable) -> list[ImagePacket]:
         if suffix not in SUPPORTED_EXTENSIONS:
             continue
         data = np.frombuffer(uploaded.getvalue(), dtype=np.uint8)
-        image = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)  # 读取原始通道
+        image = cv2.imdecode(data, cv2.IMREAD_COLOR)
         if image is None:
             continue
-
-        # 处理 RGBA 图像（4通道）-> 转为 RGB（3通道）
-        if image.ndim == 3 and image.shape[2] == 4:
-            print(f"[DEBUG] {uploaded.name} is RGBA, converting to RGB")
-            # 提取 RGB 通道，忽略 Alpha
-            image_rgb = image[:, :, :3].copy()
-            image = image_rgb
-        elif image.ndim == 2:  # 灰度图
-            print(f"[DEBUG] {uploaded.name} is grayscale, converting to RGB")
-            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-
         packets.append(ImagePacket(image=image, name=uploaded.name))
     return packets
 

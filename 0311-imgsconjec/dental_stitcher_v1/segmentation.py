@@ -33,92 +33,36 @@ def segment_teeth(image: np.ndarray) -> SegmentationResult:
 
 
 def _segment_alphadent(image: np.ndarray) -> Optional[SegmentationResult]:
-    global _SEG_MODEL_ERROR
-
     model = _get_alphadent_model()
     if model is None:
-        print(f"[DEBUG] AlphaDent model is None, error: {_SEG_MODEL_ERROR}")
         return None
     if image.ndim != 3 or image.shape[2] != 3:
-        _SEG_MODEL_ERROR = f"alphadent_expected_bgr_image, got shape={image.shape}"
-        print(f"[DEBUG] {_SEG_MODEL_ERROR}")
+        global _SEG_MODEL_ERROR
+        _SEG_MODEL_ERROR = "alphadent_expected_bgr_image"
         return None
-
-    # 打印图像信息
-    h, w = image.shape[:2]
-    print(f"[DEBUG] Input image: {w}x{h}, dtype={image.dtype}")
-
-    # 图像增强：CLAHE（使用更高的 clip_limit 5.0）
-    enhanced = _enhance_image_clahe(image, clip_limit=5.0)
-
-    # 尝试多个置信度阈值（最后一个 0.001 作为最后手段）
-    conf_thresholds = [0.1, 0.05, 0.02, 0.01, 0.001]
-
-    for idx_conf, conf in enumerate(conf_thresholds):
-        try:
-            rgb = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
-            results = model.predict(rgb, imgsz=960, conf=conf, verbose=False)
-            print(f"[DEBUG] Model prediction (conf={conf}): {len(results) if results else 0} results")
-
-            if results and len(results) > 0:
-                # 打印检测结果
-                r = results[0]
-                if hasattr(r, 'boxes') and r.boxes is not None:
-                    num_boxes = len(r.boxes)
-                    print(f"[DEBUG]   Detected {num_boxes} boxes at conf={conf}")
-                    if num_boxes > 0:
-                        confs = r.boxes.conf.cpu().numpy() if hasattr(r.boxes.conf, 'cpu') else r.boxes.conf
-                        print(f"[DEBUG]   Confidence range: {confs.min():.4f} - {confs.max():.4f}")
-
-                        # 如果是最后一个阈值 (0.001) 且检测到的框置信度极低，发出警告
-                        if conf == 0.001 and confs.max() < 0.01:
-                            print(f"[WARNING] 检测到的目标置信度极低 (max={confs.max():.4f})，可能是误检")
-                else:
-                    print(f"[DEBUG]   boxes attribute: {r.boxes if hasattr(r, 'boxes') else 'N/A'}")
-        except Exception as exc:  # pragma: no cover - defensive
-            _SEG_MODEL_ERROR = f"alphadent_inference_failed: {exc}"
-            print(f"[DEBUG] {_SEG_MODEL_ERROR}")
-            import traceback
-            traceback.print_exc()
-            return None
-
-        if not results:
-            print(f"[DEBUG] No results with conf={conf}, trying lower threshold...")
-            continue
-
-        masks = results[0].masks
-        if masks is None or masks.data is None or masks.data.shape[0] == 0:
-            print(f"[DEBUG] No masks found with conf={conf}: masks={masks}, data={masks.data if masks else None}")
-            continue
-
-        # 找到了有效的 mask
+    try:
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        results = model.predict(rgb, imgsz=960, conf=0.1, verbose=False)
+    except Exception as exc:  # pragma: no cover - defensive
+        _SEG_MODEL_ERROR = f"alphadent_inference_failed: {exc}"
+        return None
+    if not results:
+        _SEG_MODEL_ERROR = "alphadent_no_results"
+        return None
+    masks = results[0].masks
+    if masks is None or masks.data is None or masks.data.shape[0] == 0:
+        combined = np.zeros(image.shape[:2], dtype=np.uint8)
+    else:
         mask_data = masks.data
         if hasattr(mask_data, "detach"):
             mask_data = mask_data.detach().cpu().numpy()
         mask_bool = np.any(mask_data > 0.5, axis=0)
         combined = (mask_bool.astype(np.uint8) * 255)
-        pixel_count = cv2.countNonZero(combined)
-        print(f"[DEBUG] Mask generated (conf={conf}): {pixel_count} pixels")
-
-        # 如果检测到的像素太少（< 1000），继续尝试更低的阈值
-        if pixel_count < 1000 and conf != conf_thresholds[-1]:
-            print(f"[DEBUG] Mask too small ({pixel_count} pixels), trying lower threshold...")
-            continue
-
-        # 将掩膜调整回原图尺寸（如果增强时改变了尺寸）
-        if enhanced.shape != image.shape:
-            combined = cv2.resize(combined, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST)
-
-        alphadent_mask = _normalize_mask(combined, image.shape[:2])
-        refined = _grabcut_refine(image, alphadent_mask)
-        mask = _fill_mask_holes(refined)
-        overlay = _overlay_mask(image, mask)
-        return SegmentationResult(mask=mask, overlay=overlay, method="alphadent_grabcut_enhanced", fallback_reason=None)
-
-    # 所有阈值都失败
-    _SEG_MODEL_ERROR = "alphadent_no_detections_at_any_confidence"
-    print(f"[DEBUG] {_SEG_MODEL_ERROR}")
-    return None
+    alphadent_mask = _normalize_mask(combined, image.shape[:2])
+    refined = _grabcut_refine(image, alphadent_mask)
+    mask = _fill_mask_holes(refined)
+    overlay = _overlay_mask(image, mask)
+    return SegmentationResult(mask=mask, overlay=overlay, method="alphadent_grabcut", fallback_reason=None)
 
 
 
@@ -191,36 +135,6 @@ def _coarse_tooth_candidate(image: np.ndarray) -> np.ndarray:
     candidate = cv2.morphologyEx(candidate, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
     return candidate
 
-
-def _enhance_image_clahe(image: np.ndarray, clip_limit: float = 3.0) -> np.ndarray:
-    """使用 CLAHE 增强图像对比度，特别适合暗图像和低对比度图像。
-
-    Args:
-        image: BGR 图像
-        clip_limit: CLAHE 对比度限制，默认 3.0（范围 0-10，越高对比度越强）
-
-    Returns:
-        增强后的 BGR 图像
-    """
-    # 计算原图亮度
-    original_brightness = image.mean()
-    print(f"[DEBUG] Original brightness: {original_brightness:.2f}")
-
-    # 转换到 LAB 颜色空间
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-
-    # 对 L 通道应用 CLAHE
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
-    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
-
-    # 转回 BGR
-    enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-    # 计算增强后亮度
-    enhanced_brightness = enhanced.mean()
-    print(f"[DEBUG] Enhanced brightness: {enhanced_brightness:.2f} (gain: {(enhanced_brightness/(original_brightness+1e-6)):.2f}x)")
-
-    return enhanced
 
 
 def _fill_mask_holes(mask: np.ndarray) -> np.ndarray:

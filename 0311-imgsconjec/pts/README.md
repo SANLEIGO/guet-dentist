@@ -1,0 +1,1 @@
+请前往下载用于牙齿分割的模型https://huggingface.co/sanleigo/alphadent_9cls_960/resolve/main/alphadent_9cls_960.pt

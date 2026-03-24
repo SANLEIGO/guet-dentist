@@ -1,9 +1,0 @@
-# Python virtual environments
-.venv/
-.venv310/
-# Python cache
-__pycache__/
-*.pyc
-# Session files
-SESSION_CONTEXT*.md
-.DS_Store
