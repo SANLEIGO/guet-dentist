@@ -9,12 +9,15 @@ from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
     QFileDialog,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -47,6 +50,13 @@ class CameraApp(QMainWindow):
         # ---------------------------------------------------------------------
         self.cap = None
         self.current_frame = None
+        self.last_saved_path = None
+        self.current_image_path = None
+        self.image_paths = []
+        self.current_image_index = -1
+        self.caries_model = None
+        self.caries_model_path = None
+        self.is_detecting = False
         self.capture_dir = os.path.join(os.path.dirname(__file__), 'captures')
         os.makedirs(self.capture_dir, exist_ok=True)
 
@@ -85,6 +95,11 @@ class CameraApp(QMainWindow):
         self.stop_btn = QPushButton('Stop')
         self.capture_btn = QPushButton('Capture')
         self.save_as_btn = QPushButton('Save As...')
+        self.import_images_btn = QPushButton('Import Images...')
+        self.prev_image_btn = QPushButton('Prev')
+        self.next_image_btn = QPushButton('Next')
+        self.import_model_btn = QPushButton('Import Model...')
+        self.detect_caries_btn = QPushButton('Detect Caries')
         self.refresh_btn = QPushButton('Refresh Cameras')
         self.camera_selector = QComboBox()
         self.camera_selector.setMinimumWidth(180)
@@ -95,12 +110,20 @@ class CameraApp(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.capture_btn.setEnabled(False)
         self.save_as_btn.setEnabled(False)
+        self.prev_image_btn.setEnabled(False)
+        self.next_image_btn.setEnabled(False)
+        self.detect_caries_btn.setEnabled(False)
 
         # 绑定按钮点击事件到对应处理函数。
         self.start_btn.clicked.connect(self.start_camera)
         self.stop_btn.clicked.connect(self.stop_camera)
         self.capture_btn.clicked.connect(self.capture_image)
         self.save_as_btn.clicked.connect(self.save_as)
+        self.import_images_btn.clicked.connect(self.import_images)
+        self.prev_image_btn.clicked.connect(self.show_prev_image)
+        self.next_image_btn.clicked.connect(self.show_next_image)
+        self.import_model_btn.clicked.connect(self.import_caries_model)
+        self.detect_caries_btn.clicked.connect(self.detect_caries)
         self.refresh_btn.clicked.connect(self.refresh_camera_list)
 
         # ---------------------------------------------------------------------
@@ -108,22 +131,39 @@ class CameraApp(QMainWindow):
         # 上方：实时预览 + 拍照结果
         # 下方：操作按钮
         # ---------------------------------------------------------------------
-        controls = QHBoxLayout()
-        controls.addWidget(QLabel('Camera:'))
-        controls.addWidget(self.camera_selector)
-        controls.addWidget(self.refresh_btn)
-        controls.addWidget(self.start_btn)
-        controls.addWidget(self.stop_btn)
-        controls.addWidget(self.capture_btn)
-        controls.addWidget(self.save_as_btn)
+        controls_top = QHBoxLayout()
+        controls_top.addWidget(QLabel('Camera:'))
+        controls_top.addWidget(self.camera_selector)
+        controls_top.addWidget(self.refresh_btn)
+        controls_top.addWidget(self.start_btn)
+        controls_top.addWidget(self.stop_btn)
+        controls_top.addWidget(self.capture_btn)
+        controls_top.addWidget(self.save_as_btn)
+
+        controls_bottom = QHBoxLayout()
+        controls_bottom.addWidget(self.import_images_btn)
+        controls_bottom.addWidget(self.import_model_btn)
+        controls_bottom.addWidget(self.detect_caries_btn)
+
+        right_panel = QVBoxLayout()
+        right_panel.addWidget(self.captured_label, 1)
+
+        image_nav = QHBoxLayout()
+        image_nav.addWidget(self.prev_image_btn)
+        image_nav.addWidget(self.next_image_btn)
+        right_panel.addLayout(image_nav)
+
+        right_wrapper = QWidget()
+        right_wrapper.setLayout(right_panel)
 
         images = QHBoxLayout()
         images.addWidget(self.video_label, 2)
-        images.addWidget(self.captured_label, 1)
+        images.addWidget(right_wrapper, 1)
 
         root = QVBoxLayout()
         root.addLayout(images, 1)
-        root.addLayout(controls)
+        root.addLayout(controls_top)
+        root.addLayout(controls_bottom)
 
         wrapper = QWidget()
         wrapper.setLayout(root)
@@ -131,6 +171,7 @@ class CameraApp(QMainWindow):
 
         # 首次启动时检测可用相机，填充选择器。
         self.refresh_camera_list()
+        self.update_detection_controls()
 
     def start_camera(self):
         """
@@ -223,22 +264,417 @@ class CameraApp(QMainWindow):
         ok = cv2.imwrite(out_path, captured)
         if ok:
             self.last_saved_path = out_path
+            self.current_image_path = out_path
+            self.image_paths = []
+            self.current_image_index = -1
             self.save_as_btn.setEnabled(True)
+            self.update_detection_controls()
             self.statusBar().showMessage(f'Captured and saved: {out_path}', 5000)
         else:
             QMessageBox.critical(self, 'Error', 'Failed to save captured image.')
 
-    def save_as(self):
+    def set_current_image(self, image_path: str):
         """
-        把最近一次拍照结果保存到用户指定路径。
+        设置当前操作图片（检测/另存为），并显示到右侧区域。
         """
-        # 先确认已有可保存的拍照文件。
-        if not hasattr(self, 'last_saved_path') or not os.path.exists(self.last_saved_path):
-            QMessageBox.warning(self, 'Warning', 'No captured image to save.')
+        if not image_path or not os.path.exists(image_path):
+            QMessageBox.warning(self, 'Warning', '图片文件不存在。')
             return
 
-        # 弹出“另存为”对话框，让用户选择路径与格式。
-        default_name = os.path.basename(self.last_saved_path)
+        image = cv2.imread(image_path)
+        if image is None:
+            QMessageBox.warning(self, 'Warning', f'无法读取图片：{image_path}')
+            return
+
+        self.current_image_path = image_path
+        self.last_saved_path = image_path
+
+        if self.image_paths and image_path in self.image_paths:
+            self.current_image_index = self.image_paths.index(image_path)
+        else:
+            self.current_image_index = -1
+
+        self.show_image(self.captured_label, image)
+        self.update_detection_controls()
+
+    def import_images(self):
+        """
+        统一导入入口：支持单张或批量导入牙齿图片。
+        """
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            'Import Dental Images',
+            '',
+            'Images (*.jpg *.jpeg *.png *.bmp)'
+        )
+        if not paths:
+            return
+
+        valid_paths = []
+        invalid_count = 0
+        for path in paths:
+            if not os.path.exists(path):
+                invalid_count += 1
+                continue
+            image = cv2.imread(path)
+            if image is None:
+                invalid_count += 1
+                continue
+            valid_paths.append(path)
+
+        if not valid_paths:
+            QMessageBox.warning(self, 'Warning', '导入失败：没有可读取的图片。')
+            return
+
+        self.image_paths = valid_paths
+        self.current_image_index = 0 if len(valid_paths) > 1 else -1
+        self.set_current_image(valid_paths[0])
+
+        if len(valid_paths) == 1:
+            self.statusBar().showMessage(f'已导入图片: {valid_paths[0]}', 4000)
+        else:
+            self.statusBar().showMessage(
+                f'批量导入完成：{len(valid_paths)} 张可用，{invalid_count} 张不可读。',
+                5000,
+            )
+
+    def show_prev_image(self):
+        """
+        在批量导入列表中显示上一张图片。
+        """
+        if not self.image_paths or self.current_image_index <= 0:
+            return
+
+        self.current_image_index -= 1
+        self.set_current_image(self.image_paths[self.current_image_index])
+        self.statusBar().showMessage(
+            f'当前批量图片：{self.current_image_index + 1}/{len(self.image_paths)}',
+            3000,
+        )
+
+    def show_next_image(self):
+        """
+        在批量导入列表中显示下一张图片。
+        """
+        if not self.image_paths or self.current_image_index >= len(self.image_paths) - 1:
+            return
+
+        self.current_image_index += 1
+        self.set_current_image(self.image_paths[self.current_image_index])
+        self.statusBar().showMessage(
+            f'当前批量图片：{self.current_image_index + 1}/{len(self.image_paths)}',
+            3000,
+        )
+
+    def import_caries_model(self):
+        """
+        手动导入 YOLO .pt 龋齿检测模型。
+        """
+        model_path, _ = QFileDialog.getOpenFileName(
+            self,
+            'Import Caries Model',
+            '',
+            'YOLO Model (*.pt)'
+        )
+        if not model_path:
+            return
+
+        if self.load_caries_model(model_path):
+            self.statusBar().showMessage(f'已加载龋齿检测模型: {model_path}', 5000)
+        self.update_detection_controls()
+
+    def load_caries_model(self, model_path: str) -> bool:
+        """
+        加载 YOLO .pt 模型。
+        """
+        if not model_path.lower().endswith('.pt'):
+            QMessageBox.warning(self, 'Warning', '当前仅支持 YOLO .pt 模型。')
+            return False
+
+        if not os.path.exists(model_path):
+            QMessageBox.critical(self, 'Error', '模型文件不存在。')
+            return False
+
+        try:
+            from ultralytics import YOLO
+        except Exception as exc:
+            QMessageBox.critical(self, 'Error', f'未安装 ultralytics，请先安装：pip install ultralytics\n\n{exc}')
+            return False
+
+        try:
+            self.caries_model = YOLO(model_path)
+            self.caries_model_path = model_path
+            return True
+        except Exception as exc:
+            self.caries_model = None
+            self.caries_model_path = None
+            QMessageBox.critical(self, 'Error', f'模型加载失败：{exc}')
+            return False
+
+    def run_caries_inference(self, image_path: str):
+        """
+        对单张图片执行龋齿检测，返回叠加图与检出数量。
+        """
+        image = cv2.imread(image_path)
+        if image is None:
+            return None, 0, '无法读取图片。'
+
+        try:
+            results = self.caries_model.predict(image, conf=0.10, verbose=False)
+        except Exception as exc:
+            return None, 0, f'龋齿检测失败：{exc}'
+
+        overlay = image.copy()
+        det_count = 0
+        names = getattr(self.caries_model, 'names', {})
+
+        if results:
+            boxes = getattr(results[0], 'boxes', None)
+            if boxes is not None and boxes.data is not None:
+                xyxy_arr = boxes.xyxy.cpu().numpy() if hasattr(boxes.xyxy, 'cpu') else boxes.xyxy
+                conf_arr = boxes.conf.cpu().numpy() if hasattr(boxes.conf, 'cpu') else boxes.conf
+                cls_arr = boxes.cls.cpu().numpy() if hasattr(boxes.cls, 'cpu') else boxes.cls
+
+                for idx in range(len(xyxy_arr)):
+                    x1, y1, x2, y2 = [int(v) for v in xyxy_arr[idx]]
+                    conf = float(conf_arr[idx])
+                    cls_id = int(cls_arr[idx])
+
+                    if isinstance(names, dict):
+                        label_name = names.get(cls_id, f'class_{cls_id}')
+                    elif isinstance(names, list) and 0 <= cls_id < len(names):
+                        label_name = names[cls_id]
+                    else:
+                        label_name = f'class_{cls_id}'
+
+                    label_text = f'{label_name} {conf:.2f}'
+                    cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                    cv2.putText(
+                        overlay,
+                        label_text,
+                        (x1, max(20, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 255, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
+                    det_count += 1
+
+        return overlay, det_count, None
+
+    def show_single_result_dialog(self, image_path: str, overlay, det_count: int):
+        """
+        显示单张推理结果弹窗。
+        """
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Caries Detection Result')
+        dialog.resize(900, 700)
+
+        layout = QVBoxLayout(dialog)
+        info = QLabel(f'{os.path.basename(image_path)} | 检出: {det_count}')
+        info.setAlignment(Qt.AlignCenter)
+        layout.addWidget(info)
+
+        image_label = QLabel()
+        image_label.setAlignment(Qt.AlignCenter)
+        image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
+        pix = QPixmap.fromImage(qimg).scaled(840, 560, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        image_label.setPixmap(pix)
+        layout.addWidget(image_label)
+
+        buttons = QHBoxLayout()
+
+        save_btn = QPushButton('Download Result')
+
+        def save_single_result():
+            default_name = f"{os.path.splitext(os.path.basename(image_path))[0]}_detected.jpg"
+            target, _ = QFileDialog.getSaveFileName(
+                dialog,
+                'Save Detection Result',
+                default_name,
+                'Images (*.jpg *.jpeg *.png *.bmp)'
+            )
+            if not target:
+                return
+            if not cv2.imwrite(target, overlay):
+                QMessageBox.critical(dialog, 'Error', '保存推理结果失败。')
+                return
+            self.statusBar().showMessage(f'已保存推理结果: {target}', 5000)
+
+        save_btn.clicked.connect(save_single_result)
+
+        close_btn = QPushButton('Close')
+        close_btn.clicked.connect(dialog.accept)
+
+        buttons.addWidget(save_btn)
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+
+        dialog.exec_()
+
+    def show_batch_results_dialog(self, result_items):
+        """
+        显示批量推理结果弹窗（网格布局）。
+        """
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Batch Caries Detection Results')
+        dialog.resize(1200, 800)
+
+        root = QVBoxLayout(dialog)
+
+        summary = QLabel(f'批量推理完成：{len(result_items)} 张检测到疑似龋齿')
+        summary.setAlignment(Qt.AlignCenter)
+        root.addWidget(summary)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        grid = QGridLayout(container)
+
+        for idx, item in enumerate(result_items):
+            path = item['path']
+            overlay = item['overlay']
+            det_count = item['det_count']
+
+            cell = QWidget()
+            cell_layout = QVBoxLayout(cell)
+
+            rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb.shape
+            qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
+            pix = QPixmap.fromImage(qimg).scaled(340, 220, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+            img_label = QLabel()
+            img_label.setAlignment(Qt.AlignCenter)
+            img_label.setPixmap(pix)
+
+            text = QLabel(f"{os.path.basename(path)}\n检出: {det_count}")
+            text.setAlignment(Qt.AlignCenter)
+
+            cell_layout.addWidget(img_label)
+            cell_layout.addWidget(text)
+
+            row = idx // 3
+            col = idx % 3
+            grid.addWidget(cell, row, col)
+
+        scroll.setWidget(container)
+        root.addWidget(scroll)
+
+        buttons = QHBoxLayout()
+
+        download_all_btn = QPushButton('Download All Results')
+
+        def download_all_results():
+            target_dir = QFileDialog.getExistingDirectory(dialog, 'Select Directory to Save Results')
+            if not target_dir:
+                return
+
+            success = 0
+            failed = 0
+            for item in result_items:
+                src_name = os.path.splitext(os.path.basename(item['path']))[0]
+                out_path = os.path.join(target_dir, f'{src_name}_detected.jpg')
+                if cv2.imwrite(out_path, item['overlay']):
+                    success += 1
+                else:
+                    failed += 1
+
+            if failed == 0:
+                self.statusBar().showMessage(f'已导出 {success} 张推理结果到: {target_dir}', 5000)
+            else:
+                QMessageBox.warning(dialog, 'Warning', f'导出完成：成功 {success} 张，失败 {failed} 张。')
+
+        download_all_btn.clicked.connect(download_all_results)
+
+        close_btn = QPushButton('Close')
+        close_btn.clicked.connect(dialog.accept)
+
+        buttons.addWidget(download_all_btn)
+        buttons.addWidget(close_btn)
+        root.addLayout(buttons)
+
+        dialog.exec_()
+
+    def detect_caries(self):
+        """
+        对当前图片或批量图片执行龋齿检测，并以弹窗展示结果。
+        """
+        if self.is_detecting:
+            return
+
+        if self.caries_model is None:
+            QMessageBox.warning(self, 'Warning', '请先导入 YOLO .pt 模型。')
+            return
+
+        if not self.current_image_path or not os.path.exists(self.current_image_path):
+            QMessageBox.warning(self, 'Warning', '请先拍照或导入图片，再执行龋齿检测。')
+            self.update_detection_controls()
+            return
+
+        self.is_detecting = True
+        self.update_detection_controls()
+        self.import_model_btn.setEnabled(False)
+
+        try:
+            if len(self.image_paths) > 1:
+                self.statusBar().showMessage('批量龋齿检测中...', 2000)
+                result_items = []
+
+                for path in self.image_paths:
+                    overlay, det_count, err = self.run_caries_inference(path)
+                    if err is not None:
+                        continue
+                    if det_count > 0:
+                        result_items.append({'path': path, 'overlay': overlay, 'det_count': det_count})
+
+                if not result_items:
+                    QMessageBox.warning(self, 'Warning', '批量图片中未检测到疑似龋齿。')
+                else:
+                    self.show_batch_results_dialog(result_items)
+                    self.statusBar().showMessage(f'批量检测完成：{len(result_items)} 张有疑似龋齿。', 5000)
+            else:
+                self.statusBar().showMessage('龋齿检测中...', 2000)
+                overlay, det_count, err = self.run_caries_inference(self.current_image_path)
+                if err is not None:
+                    QMessageBox.critical(self, 'Error', err)
+                elif det_count == 0:
+                    QMessageBox.warning(self, 'Warning', '未检测到疑似龋齿。')
+                else:
+                    self.show_single_result_dialog(self.current_image_path, overlay, det_count)
+                    self.statusBar().showMessage(f'龋齿检测完成：检测到 {det_count} 处疑似目标。', 5000)
+        finally:
+            self.is_detecting = False
+            self.import_model_btn.setEnabled(True)
+            self.update_detection_controls()
+
+    def update_detection_controls(self):
+        """
+        根据模型与当前图片状态更新按钮可用性。
+        """
+        has_model = self.caries_model is not None
+        has_image = bool(self.current_image_path and os.path.exists(self.current_image_path))
+        self.detect_caries_btn.setEnabled(has_model and has_image and not self.is_detecting)
+        self.save_as_btn.setEnabled(has_image)
+
+        has_batch = len(self.image_paths) > 0 and self.current_image_index >= 0
+        self.prev_image_btn.setEnabled(has_batch and self.current_image_index > 0)
+        self.next_image_btn.setEnabled(has_batch and self.current_image_index < len(self.image_paths) - 1)
+
+    def save_as(self):
+        """
+        把当前图片保存到用户指定路径。
+        """
+        if not self.current_image_path or not os.path.exists(self.current_image_path):
+            QMessageBox.warning(self, 'Warning', 'No image to save.')
+            return
+
+        default_name = os.path.basename(self.current_image_path)
         target, _ = QFileDialog.getSaveFileName(
             self,
             'Save Captured Image',
@@ -248,9 +684,9 @@ class CameraApp(QMainWindow):
         if not target:
             return
 
-        image = cv2.imread(self.last_saved_path)
+        image = cv2.imread(self.current_image_path)
         if image is None:
-            QMessageBox.critical(self, 'Error', 'Cannot read temporary captured image.')
+            QMessageBox.critical(self, 'Error', 'Cannot read current image.')
             return
 
         if not cv2.imwrite(target, image):
