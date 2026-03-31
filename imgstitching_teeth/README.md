@@ -5,10 +5,14 @@
 ## ✨ 功能特性
 
 ### 🔪 牙齿分割
-- **深度学习方法**：使用 AlphaDent (YOLOv8) 进行牙齿区域检测
+- **深度学习方法**：
+  - **AlphaDent (YOLOv8)**：快速准确的牙齿区域检测
+  - **U-Net**：深度学习语义分割（可选，需要准备模型文件）
 - **精细化处理**：可选 GrabCut 边界优化
+- **图像增强**：可选 CLAHE 对比度增强，提高低质量图像分割效果
 - **可视化反馈**：绿色覆盖层直观显示分割结果
 - **多种查看模式**：并排对比、网格展示、单独查看
+- **自动回退**：U-Net 不可用时自动使用 AlphaDent
 
 ### 🔗 图像拼接
 - **标准化流水线**：分割 → 特征提取 → 配准 → 融合
@@ -56,8 +60,11 @@ streamlit run app.py
 
 ### 2. 调整参数（可选）
 - **分割设置**：
-  - 置信度阈值：0.01-0.5，默认 0.1
-  - GrabCut 精细化：默认启用
+  - 分割模型：AlphaDent (YOLOv8) 或 U-Net
+  - AlphaDent 置信度阈值：0.01-0.5，默认 0.1（仅 AlphaDent）
+  - GrabCut 精细化：默认启用（两种模型都支持）
+  - CLAHE 图像增强：默认启用（两种模型都支持）
+  - 增强强度：1.0-5.0，默认 3.0
 - **拼接设置**：
   - 特征方法：ORB（推荐）、AKAZE、SIFT、LoFTR
 
@@ -98,16 +105,27 @@ streamlit run app.py
 │   ├── diagnostics.py              # 诊断数据结构
 │   └── io_utils.py                 # I/O 工具
 └── pts/
-    └── alphadent_9cls_960.pt      # AlphaDent 模型权重（137MB）
+    ├── alphadent_9cls_960.pt      # AlphaDent 模型权重（137MB）
+    └── unet_model.pth             # U-Net 模型权重（可选，用户自备）
 ```
 
 ## ⚙️ 技术参数
 
 ### 分割
-- **模型**：AlphaDent (YOLOv8)
-- **输入尺寸**：960x960
-- **默认置信度**：0.1
-- **后处理**：GrabCut (3次迭代)
+- **AlphaDent 模型**：
+  - 架构：YOLOv8
+  - 输入尺寸：960x960
+  - 默认置信度：0.1
+  - 后处理：GrabCut (3次迭代，可选)
+- **U-Net 模型**（可选）：
+  - 架构：标准 U-Net
+  - 输入尺寸：256x256（自动调整）
+  - 输出：单通道前景概率或双通道分类
+  - 后处理：GrabCut (3次迭代，可选)
+- **图像增强**：
+  - 方法：CLAHE (Contrast Limited Adaptive Histogram Equalization)
+  - 色彩空间：LAB
+  - 增强强度：1.0-5.0
 
 ### 特征提取
 - **ORB**：2000 特征点，scaleFactor=1.2
@@ -139,17 +157,22 @@ streamlit run app.py
 ### 当前限制
 - ⚠️ 仅支持 **2 张图像**的拼接
 - ⚠️ 不支持 LoFTR（未实现）
-- ⚠️ 需要下载 137MB 的模型文件
+- ⚠️ 需要下载 137MB 的 AlphaDent 模型文件
+- ⚠️ U-Net 模型需要用户自备（参见 `pts/UNET_README.md`）
 
 ## 🐛 故障排查
 
 ### 分割失败（全绿掩膜）
-**原因**：AlphaDent 模型未加载
+**原因**：
+- AlphaDent 模型未加载
+- U-Net 模型未加载且 AlphaDent 也不可用
 
 **解决方案**：
 1. 检查环境变量：`echo $DENTAL_SEG_WEIGHTS`
-2. 确认模型文件存在：`ls -lh pts/alphadent_9cls_960.pt`
-3. 使用启动脚本：`./run.sh`
+2. 确认 AlphaDent 模型文件存在：`ls -lh pts/alphadent_9cls_960.pt`
+3. 如使用 U-Net，确认模型文件存在：`ls -lh pts/unet_model.pth`
+4. 检查 `.env` 文件配置
+5. 使用启动脚本：`./run.sh`
 
 ### 拼接失败
 **原因**：图像重叠不足或质量不佳

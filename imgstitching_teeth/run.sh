@@ -2,18 +2,6 @@
 
 # 口腔内窥镜拼接应用启动脚本
 
-# 设置环境变量
-export DENTAL_SEG_WEIGHTS="$(pwd)/pts/alphadent_9cls_960.pt"
-
-# 检查模型文件
-if [ ! -f "$DENTAL_SEG_WEIGHTS" ]; then
-    echo "❌ 错误: 模型文件不存在: $DENTAL_SEG_WEIGHTS"
-    exit 1
-fi
-
-echo "✓ 模型文件: $DENTAL_SEG_WEIGHTS"
-echo "✓ 文件大小: $(du -h "$DENTAL_SEG_WEIGHTS" | cut -f1)"
-
 # 检查虚拟环境
 if [ -d ".venv310" ]; then
     VENV_DIR=".venv310"

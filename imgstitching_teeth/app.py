@@ -35,13 +35,22 @@ def main() -> None:
 
         if uploads:
             st.subheader("⚙️ 分割设置")
+            seg_method = st.selectbox(
+                "分割模型",
+                ["AlphaDent (YOLOv8)", "U-Net"],
+                index=0,
+                help="AlphaDent: 快速准确 | U-Net: 深度学习分割"
+            )
+            seg_method_internal = "alphadent" if "AlphaDent" in seg_method else "unet"
+
             seg_conf = st.slider(
                 "AlphaDent 置信度阈值",
                 min_value=0.01,
                 max_value=0.5,
                 value=0.1,
                 step=0.01,
-                help="越低越敏感，越高越严格"
+                help="越低越敏感，越高越严格",
+                disabled=(seg_method_internal == "unet")
             )
             use_grabcut = st.checkbox("启用 GrabCut 精细化", value=True, help="使用 GrabCut 优化分割边界")
             use_enhancement = st.checkbox("启用 CLAHE 图像增强", value=True, help="增强暗图像和低对比度图像，提高检测率")
@@ -97,16 +106,20 @@ def main() -> None:
     with col_seg_btn:
         run_segmentation = st.button("执行分割", type="secondary", width="stretch")
 
-    with col_seg_info:
-        st.info(
-            """
-            **分割说明**：
-            - 使用 AlphaDent (YOLOv8) 进行牙齿区域检测
-            - 可选 GrabCut 精细化分割边界
-            - 绿色覆盖区域表示识别为牙齿的部分
-            - 后续拼接只会保留分割出的牙齿主体区域
-            """
-        )
+        with col_seg_info:
+            method_name = "AlphaDent (YOLOv8)" if seg_method_internal == "alphadent" else "U-Net"
+            grabcut_status = "启用" if use_grabcut else "不启用"
+            enhancement_status = "启用" if use_enhancement else "不启用"
+            st.info(
+                f"""
+                **分割说明**：
+                - 使用 {method_name} 进行牙齿区域检测
+                - GrabCut 精细化：{grabcut_status}
+                - CLAHE 图像增强：{enhancement_status}
+                - 绿色覆盖区域表示识别为牙齿的部分
+                - 后续拼接只会保留分割出的牙齿主体区域
+                """
+            )
 
     if run_segmentation:
         with st.spinner("🔄 正在分割图像..."):
@@ -116,28 +129,61 @@ def main() -> None:
             progress_bar = st.progress(0)
             status_text = st.empty()
 
+            has_error = False
+            error_messages = []
+
             for idx, packet in enumerate(packets):
                 status_text.text(f"正在处理第 {idx+1}/{len(packets)} 张图像: {packet.name}")
                 progress_bar.progress((idx + 1) / len(packets))
 
-                seg_result = segment_teeth(packet.image)
+                try:
+                    seg_result = segment_teeth(
+                        packet.image,
+                        method=seg_method_internal,
+                        use_grabcut=use_grabcut,
+                        use_enhancement=use_enhancement,
+                        enhancement_level=enhancement_level
+                    )
 
-                if cv2.countNonZero(seg_result.mask) == 0:
-                    st.warning(f"⚠️ 图像 {idx} ({packet.name}) 分割结果为空，使用全白 mask")
-                    seg_result = fallback_full_mask(packet.image)
+                    if cv2.countNonZero(seg_result.mask) == 0:
+                        st.warning(f"⚠️ 图像 {idx} ({packet.name}) 分割结果为空，使用全白 mask")
+                        seg_result = fallback_full_mask(packet.image)
 
-                mask_ratio = float(cv2.countNonZero(seg_result.mask) / seg_result.mask.size)
+                    mask_ratio = float(cv2.countNonZero(seg_result.mask) / seg_result.mask.size)
 
-                seg_results.append(seg_result)
-                seg_metrics.append({
-                    "index": idx,
-                    "name": packet.name,
-                    "method": seg_result.method,
-                    "fallback": seg_result.fallback_reason,
-                    "coverage": mask_ratio,
-                    "pixels": int(cv2.countNonZero(seg_result.mask)),
-                    "total": seg_result.mask.size
-                })
+                    seg_results.append(seg_result)
+                    seg_metrics.append({
+                        "index": idx,
+                        "name": packet.name,
+                        "method": seg_result.method,
+                        "fallback": seg_result.fallback_reason,
+                        "coverage": mask_ratio,
+                        "pixels": int(cv2.countNonZero(seg_result.mask)),
+                        "total": seg_result.mask.size
+                    })
+
+                except RuntimeError as e:
+                    has_error = True
+                    error_msg = f"图像 {idx+1} ({packet.name}) 分割失败: {str(e)}"
+                    error_messages.append(error_msg)
+                    st.error(f"❌ {error_msg}")
+                except Exception as e:
+                    has_error = True
+                    error_msg = f"图像 {idx+1} ({packet.name}) 发生意外错误: {str(e)}"
+                    error_messages.append(error_msg)
+                    st.error(f"❌ {error_msg}")
+
+            if has_error:
+                st.error("❌ 分割过程中出现错误，请检查错误信息并调整配置后重试。")
+                if error_messages:
+                    with st.expander("查看详细错误信息"):
+                        for msg in error_messages:
+                            st.text(msg)
+                st.stop()
+
+            if len(seg_results) == 0:
+                st.error("❌ 没有成功分割任何图像，请检查模型配置和图像质量。")
+                st.stop()
 
             st.session_state.seg_results = seg_results
             st.session_state.seg_metrics = seg_metrics
