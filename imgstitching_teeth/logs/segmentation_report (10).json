@@ -1,0 +1,42 @@
+{
+  "timestamp": "2026-04-01T16:57:33.531437",
+  "total_images": 4,
+  "metrics": [
+    {
+      "index": 0,
+      "name": "01right.png",
+      "method": "unet_grabcut",
+      "fallback": null,
+      "coverage": 0.09894819857214013,
+      "pixels": 119193,
+      "total": 1204600
+    },
+    {
+      "index": 1,
+      "name": "02middle.png",
+      "method": "unet_grabcut",
+      "fallback": null,
+      "coverage": 0.074201394653827,
+      "pixels": 89383,
+      "total": 1204600
+    },
+    {
+      "index": 2,
+      "name": "03middle_tr.png",
+      "method": "unet_grabcut",
+      "fallback": null,
+      "coverage": 0.0535764608371322,
+      "pixels": 32320,
+      "total": 603250
+    },
+    {
+      "index": 3,
+      "name": "04left.png",
+      "method": "unet_grabcut",
+      "fallback": null,
+      "coverage": 0.07054042835796115,
+      "pixels": 84973,
+      "total": 1204600
+    }
+  ]
+}

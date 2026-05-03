@@ -1,0 +1,13 @@
+numpy>=1.26
+opencv-python>=4.10
+streamlit>=1.42
+streamlit-autorefresh>=1.0.0
+torch>=2.2
+torchvision>=0.17
+kornia>=0.7.4
+ultralytics>=8.1.0
+python-dotenv>=1.0.0
+huggingface_hub>=0.30
+fastapi>=0.115
+uvicorn>=0.30
+trimesh>=4.5
