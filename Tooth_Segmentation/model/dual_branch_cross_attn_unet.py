@@ -1,4 +1,4 @@
-﻿import torch
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
@@ -50,6 +50,59 @@ class UpBlock(nn.Module):
         return x
 
 
+
+class CNNTransformerFusion(nn.Module):
+    def __init__(self, channels, mlp_ratio=2):
+        super().__init__()
+
+        self.norm1 = nn.LayerNorm(channels)
+        self.norm2 = nn.LayerNorm(channels)
+
+        mlp_hidden = channels * mlp_ratio
+
+        # MLP for interaction learning
+        self.mlp_interact = nn.Sequential(
+            nn.Linear(channels * 2, channels ),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(channels , channels),
+            nn.Dropout(0.1),
+        )
+
+        # 特征增强 MLP
+        self.mlp_cnn = nn.Sequential(
+            nn.Linear(channels, mlp_hidden),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(mlp_hidden, channels),
+        )
+        self.mlp_trans = nn.Sequential(
+            nn.Linear(channels, mlp_hidden),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(mlp_hidden, channels),
+        )
+        self.cnn_fuse = nn.Sequential(
+            ConvBNReLU(channels,channels,3,1),
+        )
+
+
+
+    def forward(self, feat_a, feat_b):
+        B, C, H, W = feat_a.shape
+
+        a = feat_a.flatten(2).transpose(1, 2)  # (B, HW, C)
+        b = feat_b.flatten(2).transpose(1, 2)
+        interaction = self.mlp_interact(torch.cat([a, b], dim=-1))
+        fused = interaction + self.mlp_cnn(self.norm1(a)) + self.mlp_trans(self.norm2(b))
+        out = fused.transpose(1, 2).reshape(B, C, H, W)
+
+        return self.cnn_fuse(out)
+
+
+
+
+
 class PretrainedSwinEncoder(nn.Module):
     def __init__(self, model_name="swin_tiny_patch4_window7_224", pretrained=True, img_size=512):
         super().__init__()
@@ -89,55 +142,6 @@ class PretrainedSwinEncoder(nn.Module):
 
 LightweightTransformerEncoder = PretrainedSwinEncoder
 
-class CNNTransformerFusion(nn.Module):
-    def __init__(self, channels, mlp_ratio=2):
-        super().__init__()
-
-        self.norm1 = nn.LayerNorm(channels)
-        self.norm2 = nn.LayerNorm(channels)
-
-
-        mlp_hidden = channels * mlp_ratio
-
-        # MLP for interaction learning
-        self.mlp_interact = nn.Sequential(
-            nn.Linear(channels*2, channels ),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(channels , channels),
-            nn.Dropout(0.1),
-        )
-
-        # 特征增强 MLP
-        self.mlp_cnn = nn.Sequential(
-            nn.Linear(channels, mlp_hidden),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(mlp_hidden, channels),
-        )
-        self.mlp_trans = nn.Sequential(
-            nn.Linear(channels, mlp_hidden),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(mlp_hidden, channels),
-        )
-        self.cnn_fuse = nn.Sequential(
-            ConvBNReLU(channels,channels,3,1),
-        )
-
-
-
-    def forward(self, feat_a, feat_b):
-        B, C, H, W = feat_a.shape
-
-        a = feat_a.flatten(2).transpose(1, 2)
-        b = feat_b.flatten(2).transpose(1, 2)
-        interaction = self.mlp_interact(torch.cat([a, b], dim=-1))
-        fused = interaction + self.mlp_cnn(self.norm1(a)) + self.mlp_trans(self.norm2(b))
-        out = fused.transpose(1, 2).reshape(B, C, H, W)
-
-        return self.cnn_fuse(out)
-
 
 class DecoderGuidedFusion(nn.Module):
     def __init__(self, cnn_channels, trans_channels, decoder_channels, out_channels):
@@ -147,6 +151,10 @@ class DecoderGuidedFusion(nn.Module):
 
         self.cnn_trans_fuse = CNNTransformerFusion(out_channels)
 
+        # self.weight_gate = nn.Sequential(
+        #     ConvBNReLU(out_channels * 2, out_channels, 1,0),
+        #     nn.Conv2d(out_channels, 2, 1)
+        # )
 
         # self.refine = DoubleConv(out_channels, out_channels)
         self.fuse = nn.Sequential(
@@ -162,6 +170,11 @@ class DecoderGuidedFusion(nn.Module):
         ct_fused = self.cnn_trans_fuse(cnn_feat, trans_feat)
 
         feat_cat = torch.cat([ct_fused, dec_p], dim=1)
+        # weights = torch.softmax(self.weight_gate(feat_cat), dim=1)
+        # w1, w2 = torch.chunk(weights, 2, dim=1)
+        # fused = w1 * ct_fused + w2 * dec_p
+
+        # final_feat = self.refine(fused)
         feat = self.fuse(feat_cat)
         final_feat = self.up(feat)
         return final_feat
@@ -189,11 +202,14 @@ class DualBranchCrossAttnUNet(nn.Module):
 
         self.bottleneck_fusion = ConvBNReLU(2048, 1024,1,0)
 
+
+
         self.skip_fuse4 = DecoderGuidedFusion(1024, 1024, 1024, decoder_channels[4])
         self.skip_fuse3 = DecoderGuidedFusion(512, 512, decoder_channels[4], decoder_channels[3])
         self.skip_fuse2 = DecoderGuidedFusion(256, 256, decoder_channels[3], decoder_channels[2])
         self.skip_fuse1 = DecoderGuidedFusion(128, 128, decoder_channels[2], decoder_channels[1])
 
+        # self.boundary_refine = SimplifiedBoundaryHead(num_classes)
 
         self.seg_head = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
