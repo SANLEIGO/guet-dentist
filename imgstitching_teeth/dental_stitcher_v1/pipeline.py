@@ -30,7 +30,7 @@ OUTPUT_MODE = "teeth_only"
 
 def run_pipeline(
     images: list[np.ndarray],
-    feature_method: str = "orb",
+    feature_method: str = "sift",
     seg_results: Optional[list[SegmentationResult]] = None,
     enable_auto_calibration: bool = True  # 新增参数
 ) -> StitchOutputs:
@@ -318,17 +318,28 @@ def _run_pair_pipeline(
     gray0 = cv2.cvtColor(images[0], cv2.COLOR_BGR2GRAY)
     gray1 = cv2.cvtColor(images[1], cv2.COLOR_BGR2GRAY)
 
-    features_result = extract_features(gray0, seg_results[0].mask, feature_method)
-    features_fallback = None
-    if features_result.descriptors is None or len(features_result.keypoints) < 8:
-        features_result = extract_features(gray0, seg_results[0].mask, "orb")
-        features_fallback = "feature_fallback_orb"
+    features_result, features_target, effective_method, features_fallback = _select_feature_pair_for_matching(
+        gray0,
+        seg_results[0].mask,
+        gray1,
+        seg_results[1].mask,
+        feature_method,
+    )
 
-    feat_diag = StepDiagnostics(True, {"method": features_result.method}, features_fallback or features_result.fallback_reason)
-
-    features_target = extract_features(gray1, seg_results[1].mask, features_result.method)
-    matches = match_features(features_result.descriptors, features_target.descriptors, features_result.method)
+    matches = match_features(features_result.descriptors, features_target.descriptors, effective_method)
     match_pts0, match_pts1 = _collect_match_points(features_result, features_target, matches.matches)
+
+    feat_diag = StepDiagnostics(
+        features_result.descriptors is not None and features_target.descriptors is not None,
+        {
+            "method": effective_method,
+            "preferred_method": feature_method,
+            "keypoints_image_a": len(features_result.keypoints),
+            "keypoints_image_b": len(features_target.keypoints),
+            "match_count": len(matches.matches),
+        },
+        features_fallback or features_result.fallback_reason or features_target.fallback_reason,
+    )
 
     reg_result = estimate_transform(features_result.keypoints, features_target.keypoints, matches.matches)
     blend_homography = _invert_homography(reg_result.homography)
@@ -361,6 +372,9 @@ def _run_pair_pipeline(
             "inlier_ratio": round(reg_result.inlier_ratio, 3),
             "reprojection_error": round(reg_result.reprojection_error, 3),
             "mask_overlap_ratio": round(quality_gate["mask_overlap_ratio"], 3),
+            "warp_area_ratio": round(quality_gate["warp_area_ratio"], 3),
+            "warp_canvas_ratio": round(quality_gate["warp_canvas_ratio"], 3),
+            "warp_perspective_strength": round(quality_gate["warp_perspective_strength"], 3),
             "gate_passed": quality_gate["gate_passed"],
             "confidence_level": quality_gate["confidence_level"],
             "degrade_reasons": quality_gate["degrade_reasons"],
@@ -371,14 +385,23 @@ def _run_pair_pipeline(
     stitched = None
     stitched_mask = None
     blend_diag = StepDiagnostics(False, {"reason": "registration_failed", "output_mode": OUTPUT_MODE})
-    if blend_homography is not None:
-        stitched, stitched_mask = blend_images(
+    if blend_homography is not None and quality_gate["gate_passed"]:
+        inlier_match_pts0, inlier_match_pts1 = _filter_inlier_points(
+            match_pts0,
+            match_pts1,
+            reg_result.inlier_mask,
+        )
+        blend_result = blend_images(
             extracted_images[0],
             extracted_images[1],
             blend_homography,
             base_mask=seg_results[0].mask,
             overlay_mask=seg_results[1].mask,
+            base_points=inlier_match_pts0,
+            overlay_points=inlier_match_pts1,
         )
+        stitched = blend_result.image
+        stitched_mask = blend_result.mask
         quality_gate["stitched_mask_coverage"] = float(cv2.countNonZero(stitched_mask) / stitched_mask.size) if stitched_mask.size else 0.0
         if any(item.get("used_fallback_mask") for item in per_image):
             quality_gate.setdefault("degrade_reasons", []).append("degraded_teeth_only_fallback")
@@ -386,15 +409,31 @@ def _run_pair_pipeline(
             True,
             {
                 "method": "masked_feather",
+                "warp_mode": blend_result.warp_mode,
+                "control_point_count": blend_result.control_point_count,
                 "confidence_level": quality_gate["confidence_level"],
                 "gate_passed": quality_gate["gate_passed"],
                 "output_mode": OUTPUT_MODE,
                 "strict_teeth_only": not any(item.get("used_fallback_mask") for item in per_image),
                 "stitched_mask_coverage": round(quality_gate["stitched_mask_coverage"], 3),
             },
-            None if quality_gate["gate_passed"] else "low_confidence_blend",
+            blend_result.fallback_reason if blend_result.fallback_reason else (None if quality_gate["gate_passed"] else "low_confidence_blend"),
         )
         per_pair[0]["stitched_mask_coverage"] = round(quality_gate["stitched_mask_coverage"], 3)
+        per_pair[0]["strict_teeth_only"] = not any(item.get("used_fallback_mask") for item in per_image)
+        per_pair[0]["warp_mode"] = blend_result.warp_mode
+        per_pair[0]["warp_control_points"] = blend_result.control_point_count
+    elif blend_homography is not None:
+        blend_diag = StepDiagnostics(
+            False,
+            {
+                "reason": "quality_gate_rejected",
+                "confidence_level": quality_gate["confidence_level"],
+                "gate_passed": quality_gate["gate_passed"],
+                "output_mode": OUTPUT_MODE,
+            },
+            "low_confidence_blend",
+        )
         per_pair[0]["strict_teeth_only"] = not any(item.get("used_fallback_mask") for item in per_image)
 
     diagnostics = StitchDiagnostics(
@@ -444,6 +483,41 @@ def _prepare_segmentation_inputs(
                 seg_result = fallback_full_mask(img)
         prepared_seg_results.append(seg_result)
     return prepared_seg_results, segmentation_source
+
+
+def _select_feature_pair_for_matching(
+    gray0: np.ndarray,
+    mask0: np.ndarray,
+    gray1: np.ndarray,
+    mask1: np.ndarray,
+    preferred_method: str,
+) -> tuple:
+    attempted_methods: list[str] = []
+    for method in _candidate_feature_methods(preferred_method):
+        attempted_methods.append(method)
+        features_a = extract_features(gray0, mask0, method)
+        features_b = extract_features(gray1, mask1, method)
+        if features_a.descriptors is not None and features_b.descriptors is not None:
+            fallback_reason = None
+            if method != preferred_method:
+                fallback_reason = f"feature_fallback_{preferred_method}_to_{method}"
+            return features_a, features_b, method, fallback_reason
+
+    fallback_method = _candidate_feature_methods(preferred_method)[-1]
+    return (
+        extract_features(gray0, mask0, fallback_method),
+        extract_features(gray1, mask1, fallback_method),
+        fallback_method,
+        f"feature_unresolved_attempts_{'_'.join(attempted_methods)}",
+    )
+
+
+def _candidate_feature_methods(preferred_method: str) -> list[str]:
+    ordered: list[str] = []
+    for method in [preferred_method, "sift", "akaze", "orb"]:
+        if method not in ordered:
+            ordered.append(method)
+    return ordered
 
 
 def _build_per_image_diagnostics(
@@ -532,6 +606,36 @@ def _evaluate_pair_quality(
         elif mask_overlap_ratio < 0.08:
             degrade_reasons.append("limited_mask_overlap")
 
+        geometry_metrics = _compute_warp_geometry_metrics(
+            seg_results[0].mask.shape,
+            seg_results[1].mask.shape,
+            blend_homography,
+        )
+        if geometry_metrics["invalid"]:
+            fail_reasons.append("invalid_warp_geometry")
+        else:
+            if geometry_metrics["area_ratio"] < 0.15 or geometry_metrics["area_ratio"] > 6.0:
+                fail_reasons.append("warp_area_ratio_out_of_range")
+            elif geometry_metrics["area_ratio"] < 0.33 or geometry_metrics["area_ratio"] > 3.0:
+                degrade_reasons.append("warp_area_ratio_suspicious")
+
+            if geometry_metrics["canvas_ratio"] > 9.0:
+                fail_reasons.append("warp_canvas_too_large")
+            elif geometry_metrics["canvas_ratio"] > 5.0:
+                degrade_reasons.append("warp_canvas_expanded")
+
+            if geometry_metrics["perspective_strength"] > 0.22:
+                fail_reasons.append("warp_perspective_too_strong")
+            elif geometry_metrics["perspective_strength"] > 0.10:
+                degrade_reasons.append("warp_perspective_strong")
+    if reg_result.homography is None or blend_homography is None:
+        geometry_metrics = {
+            "invalid": True,
+            "area_ratio": 0.0,
+            "canvas_ratio": 0.0,
+            "perspective_strength": 0.0,
+        }
+
     gate_passed = len(fail_reasons) == 0
     if fail_reasons:
         confidence_level = "low"
@@ -550,6 +654,9 @@ def _evaluate_pair_quality(
         "inlier_count": int(reg_result.inlier_count),
         "inlier_ratio": float(reg_result.inlier_ratio),
         "reprojection_error": float(reg_result.reprojection_error),
+        "warp_area_ratio": float(geometry_metrics["area_ratio"]),
+        "warp_canvas_ratio": float(geometry_metrics["canvas_ratio"]),
+        "warp_perspective_strength": float(geometry_metrics["perspective_strength"]),
         "output_mode": OUTPUT_MODE,
         "strict_teeth_only": not any(item["used_fallback_mask"] for item in per_image),
     }
@@ -571,6 +678,41 @@ def _compute_mask_overlap_ratio(base_mask: np.ndarray, overlay_mask: np.ndarray,
     if union == 0:
         return 0.0
     return float(intersection / union)
+
+
+def _compute_warp_geometry_metrics(
+    base_shape: tuple[int, int],
+    overlay_shape: tuple[int, int],
+    homography: np.ndarray,
+) -> dict:
+    base_h, base_w = base_shape[:2]
+    overlay_h, overlay_w = overlay_shape[:2]
+    corners = np.array(
+        [[0, 0], [overlay_w, 0], [overlay_w, overlay_h], [0, overlay_h]],
+        dtype=np.float32,
+    ).reshape(-1, 1, 2)
+    warped = cv2.perspectiveTransform(corners, homography).reshape(-1, 2)
+    if not np.isfinite(warped).all():
+        return {"invalid": True, "area_ratio": 0.0, "canvas_ratio": 0.0, "perspective_strength": 0.0}
+
+    polygon_area = abs(float(cv2.contourArea(warped.astype(np.float32))))
+    overlay_area = max(float(overlay_w * overlay_h), 1.0)
+
+    min_x = min(0.0, float(warped[:, 0].min()))
+    min_y = min(0.0, float(warped[:, 1].min()))
+    max_x = max(float(base_w), float(warped[:, 0].max()))
+    max_y = max(float(base_h), float(warped[:, 1].max()))
+    canvas_area = max((max_x - min_x) * (max_y - min_y), 1.0)
+    base_area = max(float(base_w * base_h), 1.0)
+
+    perspective_strength = abs(float(homography[2, 0])) * overlay_w + abs(float(homography[2, 1])) * overlay_h
+
+    return {
+        "invalid": False,
+        "area_ratio": polygon_area / overlay_area,
+        "canvas_ratio": canvas_area / base_area,
+        "perspective_strength": perspective_strength,
+    }
 
 
 def _invert_homography(homography: Optional[np.ndarray]) -> Optional[np.ndarray]:
@@ -619,6 +761,21 @@ def _collect_match_points(
     pts0 = np.float32([features_a.keypoints[m.queryIdx].pt for m in matches])
     pts1 = np.float32([features_b.keypoints[m.trainIdx].pt for m in matches])
     return pts0, pts1
+
+
+def _filter_inlier_points(
+    points_a: Optional[np.ndarray],
+    points_b: Optional[np.ndarray],
+    inlier_mask: np.ndarray,
+) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    if points_a is None or points_b is None or len(points_a) == 0:
+        return None, None
+    if inlier_mask is None or len(inlier_mask) != len(points_a):
+        return points_a, points_b
+    keep = np.asarray(inlier_mask, dtype=bool)
+    if keep.sum() < 8:
+        return points_a, points_b
+    return points_a[keep], points_b[keep]
 
 
 def _extract_teeth_image(image: np.ndarray, mask: np.ndarray) -> np.ndarray:

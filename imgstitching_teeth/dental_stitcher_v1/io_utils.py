@@ -16,11 +16,17 @@ class ImagePacket:
         name: str,
         timestamp: Optional[str] = None,
         arch: Optional[str] = None,  # "lower" or "upper"
+        acceptance_score: Optional[float] = None,
+        quality_passed: Optional[bool] = None,
+        meta: Optional[dict] = None,
     ):
         self.image = image
         self.name = name
         self.timestamp = timestamp
         self.arch = arch
+        self.acceptance_score = acceptance_score
+        self.quality_passed = quality_passed
+        self.meta = meta or {}
 
 
 def load_uploaded_images(files: Iterable) -> list[ImagePacket]:

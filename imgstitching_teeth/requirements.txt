@@ -5,6 +5,7 @@ streamlit-autorefresh>=1.0.0
 torch>=2.2
 torchvision>=0.17
 kornia>=0.7.4
+scikit-image>=0.24
 ultralytics>=8.1.0
 python-dotenv>=1.0.0
 huggingface_hub>=0.30

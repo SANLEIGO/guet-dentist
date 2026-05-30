@@ -14,7 +14,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from streamlit_autorefresh import st_autorefresh
 
-from dental_stitcher_v1.io_utils import bgr_to_rgb, load_uploaded_images, resize_for_display
+from dental_stitcher_v1.io_utils import ImagePacket, bgr_to_rgb, load_uploaded_images, resize_for_display
 from dental_stitcher_v1.pipeline import run_pipeline
 from dental_stitcher_v1.segmentation import segment_teeth, fallback_full_mask
 from dental_stitcher_v1.noise_removal import (
@@ -37,6 +37,19 @@ st.set_page_config(page_title="口腔牙齿提取拼接 v1", page_icon="🦷", l
 HUNYUAN_RESULTS_DIR = Path(__file__).resolve().parent / ".runtime" / "hunyuan3d" / "results"
 
 
+def _slugify_arch_label(label: str) -> str:
+    mapping = {
+        "上牙弓": "upper",
+        "下牙弓": "lower",
+        "左上": "upper_left",
+        "右上": "upper_right",
+        "左下": "lower_left",
+        "右下": "lower_right",
+        "未知牙弓": "unknown_arch",
+    }
+    return mapping.get(label, label.replace(" ", "_").lower())
+
+
 def _encode_png_bytes(image: np.ndarray) -> bytes:
     success, encoded = cv2.imencode(".png", image)
     if not success:
@@ -44,11 +57,24 @@ def _encode_png_bytes(image: np.ndarray) -> bytes:
     return encoded.tobytes()
 
 
-def _persist_hunyuan_result(job_uid: str, model_bytes: bytes) -> Path:
+def _persist_hunyuan_result(job_uid: str, model_bytes: bytes, arch_slug: str = "unknown_arch") -> Path:
     HUNYUAN_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = HUNYUAN_RESULTS_DIR / f"{job_uid}.glb"
+    output_path = HUNYUAN_RESULTS_DIR / f"{arch_slug}_{job_uid}.glb"
     output_path.write_bytes(model_bytes)
     return output_path
+
+
+def _default_hunyuan_steps(subfolder: str) -> int:
+    return 5 if "turbo" in subfolder else 30
+
+
+def _clean_status_text(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    cleaned = "".join(ch for ch in text if ch == "\n" or ch == "\t" or ord(ch) >= 32)
+    cleaned = cleaned.replace("\r", " ").replace("\uFFFD", " ")
+    cleaned = " ".join(cleaned.split())
+    return cleaned
 
 
 def _render_glb_preview(glb_bytes: bytes, height: int = 560) -> None:
@@ -94,88 +120,121 @@ def _render_hunyuan_runtime_panel() -> None:
     manager = HunyuanRuntimeManager()
     status = manager.read_status()
 
-    with st.expander("🛠️ Hunyuan3D 本地启动器", expanded=False):
-        st.caption(
-            "这里可以直接在当前机器上一键拉取 Hunyuan3D-2 代码、安装依赖、下载 2mv 模型并启动本地 bridge 服务。"
-        )
+    with st.expander("🛠️ Hunyuan3D 本地服务", expanded=not status.service_healthy):
+        st.caption("按提示点下一步即可。第一次使用通常只需要点一次。")
 
-        st.dataframe(
-            [{
-                "代码仓库": "已就绪" if status.repo_exists else "未下载",
-                "依赖环境": "已安装" if status.install_ready else "未安装",
-                "模型文件": "已下载" if status.model_ready else "未下载",
-                "后台任务": f"运行中 (PID {status.task_pid})" if status.task_running else "空闲",
-                "服务进程": f"运行中 (PID {status.service_pid})" if status.service_running else "未启动",
-                "服务健康": "正常" if status.service_healthy else "未就绪",
-            }],
-            width="stretch",
-        )
+        clean_user_hint = _clean_status_text(status.user_hint)
+        clean_model_message = _clean_status_text(status.model_message)
+        clean_task_message = _clean_status_text(status.task_message)
+        clean_service_message = _clean_status_text(status.service_message)
 
-        st.caption(f"仓库目录: {status.repo_dir}")
-        st.caption(f"模型目录: {status.model_dir}")
-        st.caption(f"服务地址: {status.service_url}")
+        if status.service_healthy:
+            st.success(clean_user_hint)
+        elif status.model_status == "invalid":
+            st.warning(clean_user_hint)
+        elif status.task_running:
+            st.info(clean_user_hint)
+        else:
+            st.info(clean_user_hint)
 
-        action_col1, action_col2, action_col3 = st.columns(3)
+        summary_col1, summary_col2, summary_col3 = st.columns(3)
+        with summary_col1:
+            env_state = "已就绪" if status.repo_exists and status.install_ready else "未准备"
+            st.metric("运行环境", env_state)
+        with summary_col2:
+            model_state_label = {
+                "ready": "已就绪",
+                "missing": "未下载",
+                "downloading": "下载中",
+                "invalid": "需修复",
+            }.get(status.model_status, "未知")
+            st.metric("模型文件", model_state_label)
+        with summary_col3:
+            service_state = "已就绪" if status.service_healthy else ("运行中" if status.service_running else "未启动")
+            st.metric("服务状态", service_state)
+
+        st.caption(f"模型状态：{clean_model_message}")
+        if status.task_running and clean_task_message:
+            st.caption(f"当前进度：{clean_task_message}")
+        elif clean_service_message and not status.service_healthy:
+            st.caption(f"服务探测：{clean_service_message}")
+
+        action_col1, action_col2, action_col3 = st.columns([2, 1, 1])
         with action_col1:
-            if st.button("一键下载并启动", key="hunyuan_bootstrap_and_start", type="primary", width="stretch"):
-                ok, message = manager.launch_action("bootstrap-and-start")
+            primary_disabled = status.recommended_action is None
+            if st.button(
+                status.recommended_label,
+                key="hunyuan_primary_action",
+                type="primary",
+                width="stretch",
+                disabled=primary_disabled,
+            ):
+                ok, message = manager.launch_action(status.recommended_action) if status.recommended_action else (False, "当前无需操作。")
                 if ok:
                     st.success(message)
                     st.rerun()
-                st.warning(message) if not ok else None
+                st.warning(message)
         with action_col2:
-            if st.button("仅初始化环境", key="hunyuan_setup_only", width="stretch"):
-                ok, message = manager.launch_action("setup")
-                if ok:
-                    st.success(message)
-                    st.rerun()
-                st.warning(message) if not ok else None
+            if st.button("刷新状态", key="hunyuan_runtime_refresh", width="stretch"):
+                st.rerun()
         with action_col3:
-            if st.button("仅下载模型", key="hunyuan_download_model_only", width="stretch"):
-                ok, message = manager.launch_action("download-model")
-                if ok:
-                    st.success(message)
-                    st.rerun()
-                st.warning(message) if not ok else None
-
-        action_col4, action_col5, action_col6 = st.columns(3)
-        with action_col4:
-            if st.button("仅启动服务", key="hunyuan_start_service_only", width="stretch"):
-                ok, message = manager.launch_action("start-service")
-                if ok:
-                    st.success(message)
-                    st.rerun()
-                st.warning(message) if not ok else None
-        with action_col5:
-            if st.button("停止服务", key="hunyuan_stop_service", width="stretch"):
+            if st.button(
+                "停止服务",
+                key="hunyuan_stop_service",
+                width="stretch",
+                disabled=not status.service_running,
+            ):
                 ok, message = manager.stop_service()
                 if ok:
                     st.success(message)
                     st.rerun()
-                st.warning(message) if not ok else None
-        with action_col6:
-            if st.button("刷新启动器状态", key="hunyuan_runtime_refresh", width="stretch"):
-                st.rerun()
+                st.warning(message)
 
-        if status.service_message:
-            if status.service_healthy:
-                st.success(f"服务探测结果: {status.service_message}")
-            else:
-                st.info(f"服务探测结果: {status.service_message}")
+        if status.service_healthy:
+            st.caption(f"服务地址：{status.service_url}")
 
-        log_col1, log_col2 = st.columns(2)
-        with log_col1:
-            st.markdown("#### 后台任务日志")
-            if status.task_log_tail:
-                st.code(status.task_log_tail, language="text")
-            else:
-                st.caption("暂无后台任务日志。")
-        with log_col2:
-            st.markdown("#### 服务日志")
-            if status.service_log_tail:
-                st.code(status.service_log_tail, language="text")
-            else:
-                st.caption("暂无服务日志。")
+        with st.expander("高级操作", expanded=False):
+            st.caption("遇到问题时再使用这些按钮和日志。")
+
+            advanced_col1, advanced_col2, advanced_col3 = st.columns(3)
+            with advanced_col1:
+                if st.button("仅初始化环境", key="hunyuan_setup_only", width="stretch"):
+                    ok, message = manager.launch_action("setup")
+                    if ok:
+                        st.success(message)
+                        st.rerun()
+                    st.warning(message)
+            with advanced_col2:
+                if st.button("下载/修复模型", key="hunyuan_download_model_only", width="stretch"):
+                    ok, message = manager.launch_action("download-model")
+                    if ok:
+                        st.success(message)
+                        st.rerun()
+                    st.warning(message)
+            with advanced_col3:
+                if st.button("仅启动服务", key="hunyuan_start_service_only", width="stretch"):
+                    ok, message = manager.launch_action("start-service")
+                    if ok:
+                        st.success(message)
+                        st.rerun()
+                    st.warning(message)
+
+            st.caption(f"仓库目录：{status.repo_dir}")
+            st.caption(f"模型目录：{status.model_dir}")
+
+            log_col1, log_col2 = st.columns(2)
+            with log_col1:
+                st.markdown("#### 后台任务日志")
+                if status.task_log_tail:
+                    st.code(status.task_log_tail, language="text")
+                else:
+                    st.caption("暂无后台任务日志。")
+            with log_col2:
+                st.markdown("#### 服务日志")
+                if status.service_log_tail:
+                    st.code(status.service_log_tail, language="text")
+                else:
+                    st.caption("暂无服务日志。")
 
 
 def main() -> None:
@@ -188,17 +247,56 @@ def main() -> None:
     _render_hunyuan_runtime_panel()
 
     # ============ 侧边栏配置 ============
+    capture_upper_images = st.session_state.get("upper_arch_images", [])
+    capture_lower_images = st.session_state.get("lower_arch_images", [])
+    capture_arch_options: list[str] = []
+    if len(capture_upper_images) > 0:
+        capture_arch_options.append("上牙弓")
+    if len(capture_lower_images) > 0:
+        capture_arch_options.append("下牙弓")
+
+    source_mode = "上传图像"
+    selected_capture_arch: Optional[str] = None
     with st.sidebar:
-        st.subheader("📁 图像上传")
-        uploads = st.file_uploader(
-            "上传多张口腔内窥镜图像",
-            type=["jpg", "jpeg", "png", "bmp", "tif", "tiff"],
-            accept_multiple_files=True,
+        st.subheader("📁 图像来源")
+        source_options = ["上传图像"]
+        if capture_arch_options:
+            source_options.append("使用拍照页已采集图像")
+        source_mode = st.radio(
+            "选择来源",
+            source_options,
+            index=1 if len(source_options) > 1 else 0,
+            help="如果你已经在拍照页完成了一个牙弓的采集，可以直接在这里继续处理。"
         )
+
+        uploads = None
+        if source_mode == "上传图像":
+            uploads = st.file_uploader(
+                "上传多张口腔内窥镜图像",
+                type=["jpg", "jpeg", "png", "bmp", "tif", "tiff"],
+                accept_multiple_files=True,
+            )
+        else:
+            selected_capture_arch = st.selectbox(
+                "选择已采集牙弓",
+                capture_arch_options,
+                index=0,
+                help="直接复用拍照页中已经采集完成的牙弓照片。"
+            )
+            st.caption(
+                "当前可用："
+                + "，".join(
+                    [
+                        f"上牙弓 {len(capture_upper_images)} 张" if capture_upper_images else "",
+                        f"下牙弓 {len(capture_lower_images)} 张" if capture_lower_images else "",
+                    ]
+                ).strip("，")
+            )
 
         st.divider()
 
-        if uploads:
+        has_input_source = bool(uploads) if source_mode == "上传图像" else bool(selected_capture_arch)
+        if has_input_source:
             st.subheader("⚙️ 分割设置")
             seg_method = st.selectbox(
                 "分割模型",
@@ -249,16 +347,20 @@ def main() -> None:
             st.subheader("🔗 拼接设置")
             feature_method = st.selectbox(
                 "特征方法",
-                ["orb", "akaze", "sift", "loftr"],
+                ["sift", "akaze", "orb", "loftr"],
                 index=0,
-                help="ORB: 快速稳定 | AKAZE: 高质量 | SIFT: 最精确 | LoFTR: 深度匹配"
+                help="SIFT: 对真实拍摄更稳，当前推荐 | AKAZE: 中等速度与质量 | ORB: 最快但对角度和光照更敏感 | LoFTR: 预留深度匹配入口"
             )
-            region_label = st.selectbox(
-                "采集区域",
-                ["左上", "左下", "右上", "右下"],
-                index=0,
-                help="一次只上传同一区域的相关图片，方便连续拼接"
-            )
+            if source_mode == "上传图像":
+                region_label = st.selectbox(
+                    "采集区域",
+                    ["左上", "左下", "右上", "右下"],
+                    index=0,
+                    help="一次只上传同一区域的相关图片，方便连续拼接"
+                )
+            else:
+                region_label = selected_capture_arch or "未知牙弓"
+                st.info(f"当前牙弓：{region_label}")
 
             st.subheader("✨ 去噪设置")
             enable_noise_removal = st.checkbox(
@@ -280,17 +382,28 @@ def main() -> None:
                 noise_method_internal = None
 
     # ============ 步骤 1: 上传和预览 ============
-    if not uploads:
-        st.info("👈 请先在左侧上传图像")
-        return
+    if source_mode == "上传图像":
+        if not uploads:
+            st.info("👈 请先在左侧上传图像")
+            return
+        packets = load_uploaded_images(uploads)
+    else:
+        if selected_capture_arch == "上牙弓":
+            packets = list(capture_upper_images)
+        elif selected_capture_arch == "下牙弓":
+            packets = list(capture_lower_images)
+        else:
+            packets = []
 
-    packets = load_uploaded_images(uploads)
     if len(packets) == 0:
         st.error("❌ 没有读取到有效图像文件")
         return
 
     st.markdown(f"### 📸 已上传 {len(packets)} 张图像")
-    st.info(f"当前区域：{region_label}。请确保本次上传的图片都来自同一区域，并按你希望的拼接顺序整理。")
+    if source_mode == "上传图像":
+        st.info(f"当前区域：{region_label}。请确保本次上传的图片都来自同一区域，并按你希望的拼接顺序整理。")
+    else:
+        st.info(f"当前牙弓：{region_label}。这些照片来自拍照页的已采集结果，可直接用于后续拼接和三维处理。")
     cols = st.columns(min(len(packets), 4))
     for idx, (col, packet) in enumerate(zip(cols, packets)):
         with col:
@@ -518,12 +631,13 @@ def main() -> None:
             seg_report = {
                 "timestamp": datetime.now().isoformat(),
                 "total_images": len(packets),
+                "arch_label": region_label,
                 "metrics": st.session_state.seg_metrics
             }
             st.download_button(
                 "⬇️ 下载分割报告 JSON",
                 data=json.dumps(seg_report, ensure_ascii=False, indent=2).encode("utf-8"),
-                file_name="segmentation_report.json",
+                file_name=f"segmentation_report_{_slugify_arch_label(region_label)}.json",
                 mime="application/json",
                 width="stretch"
             )
@@ -689,7 +803,12 @@ def main() -> None:
                     with col_dl1:
                         # 下载最终结果（去噪后或原始）
                         download_label = "⬇️ 下载去噪后拼接图" if enable_noise_removal else "⬇️ 下载牙齿拼接图"
-                        filename = "stitched_teeth_cleaned.png" if enable_noise_removal else "stitched_teeth_only_v1.png"
+                        arch_slug = _slugify_arch_label(region_label)
+                        filename = (
+                            f"stitched_teeth_cleaned_{arch_slug}.png"
+                            if enable_noise_removal else
+                            f"stitched_teeth_only_{arch_slug}.png"
+                        )
                         st.download_button(
                             download_label,
                             data=_encode_png_bytes(stitched_to_display),
@@ -704,7 +823,7 @@ def main() -> None:
                             st.download_button(
                                 "⬇️ 下载原始拼接图（未去噪）",
                                 data=_encode_png_bytes(outputs.stitched),
-                                file_name="stitched_teeth_original.png",
+                                file_name=f"stitched_teeth_original_{_slugify_arch_label(region_label)}.png",
                                 mime="image/png",
                                 width="stretch",
                             )
@@ -766,7 +885,7 @@ def main() -> None:
                 st.download_button(
                     "⬇️ 下载诊断 JSON",
                     data=json.dumps(diagnostic_payload, ensure_ascii=False, indent=2).encode("utf-8"),
-                    file_name="diagnostics_teeth_only_v1.json",
+                    file_name=f"diagnostics_teeth_only_{_slugify_arch_label(region_label)}.json",
                     mime="application/json",
                     width="stretch",
                 )
@@ -860,7 +979,7 @@ def main() -> None:
                         st.download_button(
                             "⬇️ 下载 3D-ready PNG",
                             data=prepared_asset.png_bytes(transparent=False),
-                            file_name="hunyuan3d_input.png",
+                            file_name=f"hunyuan3d_input_{_slugify_arch_label(region_label)}.png",
                             mime="image/png",
                             width="stretch",
                         )
@@ -868,7 +987,7 @@ def main() -> None:
                         st.download_button(
                             "⬇️ 下载透明 PNG",
                             data=prepared_asset.png_bytes(transparent=True),
-                            file_name="hunyuan3d_input_rgba.png",
+                            file_name=f"hunyuan3d_input_rgba_{_slugify_arch_label(region_label)}.png",
                             mime="image/png",
                             width="stretch",
                         )
@@ -876,7 +995,7 @@ def main() -> None:
                         st.download_button(
                             "⬇️ 下载预处理元数据",
                             data=prepared_asset.metadata_bytes(),
-                            file_name="hunyuan3d_input_metadata.json",
+                            file_name=f"hunyuan3d_input_metadata_{_slugify_arch_label(region_label)}.json",
                             mime="application/json",
                             width="stretch",
                         )
@@ -909,7 +1028,7 @@ def main() -> None:
                             st.download_button(
                                 "⬇️ 下载伪多视图 ZIP",
                                 data=pseudo_pack.archive_bytes(transparent=False),
-                                file_name="pseudo_multiview_views.zip",
+                                file_name=f"pseudo_multiview_views_{_slugify_arch_label(region_label)}.zip",
                                 mime="application/zip",
                                 width="stretch",
                             )
@@ -917,7 +1036,7 @@ def main() -> None:
                             st.download_button(
                                 "⬇️ 下载透明伪多视图 ZIP",
                                 data=pseudo_pack.archive_bytes(transparent=True),
-                                file_name="pseudo_multiview_views_rgba.zip",
+                                file_name=f"pseudo_multiview_views_rgba_{_slugify_arch_label(region_label)}.zip",
                                 mime="application/zip",
                                 width="stretch",
                             )
@@ -936,9 +1055,10 @@ def main() -> None:
                                 job_status = client.get_job_status(current_job_uid)
                                 st.session_state.hunyuan_job_status = job_status.status
                                 if job_status.model_bytes:
+                                    arch_slug = _slugify_arch_label(region_label)
                                     st.session_state.hunyuan_job_result_bytes = job_status.model_bytes
                                     st.session_state.hunyuan_job_result_path = str(
-                                        _persist_hunyuan_result(current_job_uid, job_status.model_bytes)
+                                        _persist_hunyuan_result(current_job_uid, job_status.model_bytes, arch_slug=arch_slug)
                                     )
                                 if job_status.message:
                                     st.session_state.hunyuan_job_message = job_status.message
@@ -957,7 +1077,7 @@ def main() -> None:
                                     job_uid = client.submit_multiview_async(
                                         pseudo_pack.payload_images(transparent=True),
                                         seed=1234,
-                                        num_inference_steps=24,
+                                        num_inference_steps=_default_hunyuan_steps(service_config.subfolder),
                                         guidance_scale=5.0,
                                         octree_resolution=256,
                                         texture=False,
@@ -980,9 +1100,10 @@ def main() -> None:
                                         job_status = client.get_job_status(job_uid)
                                         st.session_state.hunyuan_job_status = job_status.status
                                         if job_status.model_bytes:
+                                            arch_slug = _slugify_arch_label(region_label)
                                             st.session_state.hunyuan_job_result_bytes = job_status.model_bytes
                                             st.session_state.hunyuan_job_result_path = str(
-                                                _persist_hunyuan_result(job_uid, job_status.model_bytes)
+                                                _persist_hunyuan_result(job_uid, job_status.model_bytes, arch_slug=arch_slug)
                                             )
                                         if job_status.message:
                                             st.session_state.hunyuan_job_message = job_status.message
@@ -1019,7 +1140,7 @@ def main() -> None:
                             st.download_button(
                                 "⬇️ 下载 3D Mesh (GLB)",
                                 data=result_bytes,
-                                file_name="hunyuan3d_demo.glb",
+                                file_name=f"hunyuan3d_demo_{_slugify_arch_label(region_label)}.glb",
                                 mime="model/gltf-binary",
                                 width="stretch",
                             )

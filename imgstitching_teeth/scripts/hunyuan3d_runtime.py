@@ -8,6 +8,8 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from urllib.request import Request, urlopen
+from typing import Optional
 
 from dotenv import dotenv_values
 
@@ -122,21 +124,7 @@ def download_model() -> None:
 
     for url, path in files_to_download:
         path.parent.mkdir(parents=True, exist_ok=True)
-        print(f"[{_now()}] 下载 {path.name}")
-        _run(
-            [
-                "curl",
-                "-L",
-                "--fail",
-                "--retry",
-                "5",
-                "--retry-delay",
-                "2",
-                "-o",
-                str(path),
-                url,
-            ]
-        )
+        _download_file_with_validation(url, path)
     print(f"[{_now()}] 模型下载完成")
 
 
@@ -152,6 +140,7 @@ def start_service() -> None:
     port = str(ENV_CONFIG.get("HUNYUAN3D_SERVICE_PORT", "8081"))
     device = _resolve_device(str(ENV_CONFIG.get("HUNYUAN3D_DEVICE", "auto")))
     subfolder = str(ENV_CONFIG.get("HUNYUAN3D_SUBFOLDER", "hunyuan3d-dit-v2-mv-turbo"))
+    keepalive_seconds = _resolve_keepalive_seconds(device)
     model_path = str(MODEL_DIR if MODEL_DIR.exists() else ENV_CONFIG.get("HUNYUAN3D_MODEL_PATH", "tencent/Hunyuan3D-2mv"))
     model_file = MODEL_DIR / subfolder / ("model.fp16.safetensors" if "turbo" in subfolder or "fast" in subfolder else "model.safetensors")
     model_ckpt = MODEL_DIR / subfolder / ("model.fp16.ckpt" if "turbo" in subfolder or "fast" in subfolder else "model.ckpt")
@@ -177,6 +166,8 @@ def start_service() -> None:
         subfolder,
         "--device",
         device,
+        "--keepalive-seconds",
+        str(keepalive_seconds),
     ]
     if device.startswith("cuda"):
         command.append("--enable_flashvdm")
@@ -195,6 +186,7 @@ def start_service() -> None:
     print(f"[{_now()}] 服务启动命令已提交，PID={process.pid}")
     print(f"[{_now()}] 服务地址预期为 http://{host}:{port}")
     print(f"[{_now()}] 当前推理设备: {device}")
+    print(f"[{_now()}] 模型空闲保留时长: {keepalive_seconds:g} 秒")
 
 
 def stop_service() -> None:
@@ -242,6 +234,84 @@ def _cleanup_partial_model_downloads(target_subfolder: str) -> None:
         print(f"[{_now()}] 已清理旧的模型残留/未完成下载，共处理 {removed_count} 项")
 
 
+def _download_file_with_validation(url: str, path: Path) -> None:
+    expected_size = _get_remote_file_size(url)
+    if path.exists() and expected_size is not None:
+        local_size = path.stat().st_size
+        if local_size == expected_size and _is_model_file_valid(path):
+            print(f"[{_now()}] 已复用完整文件 {path.name} ({_format_size(local_size)})")
+            return
+        if local_size > expected_size:
+            print(f"[{_now()}] 检测到本地文件大于远端，删除后重下：{path.name}")
+            path.unlink(missing_ok=True)
+
+    print(f"[{_now()}] 下载 {path.name}")
+    if expected_size is not None:
+        print(f"[{_now()}] 远端大小: {_format_size(expected_size)}")
+
+    _run(
+        [
+            "curl",
+            "-L",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--retry",
+            "5",
+            "--retry-all-errors",
+            "--retry-delay",
+            "2",
+            "-C",
+            "-",
+            "-o",
+            str(path),
+            url,
+        ]
+    )
+
+    if expected_size is not None:
+        actual_size = path.stat().st_size if path.exists() else 0
+        if actual_size != expected_size:
+            raise RuntimeError(
+                f"下载后的文件大小不匹配：{path.name} 本地 {_format_size(actual_size)}，远端 {_format_size(expected_size)}"
+            )
+
+    if not _is_model_file_valid(path):
+        raise RuntimeError(f"下载后的模型文件校验失败：{path}")
+    print(f"[{_now()}] 已完成 {path.name}（{_format_size(path.stat().st_size)}）")
+
+
+def _get_remote_file_size(url: str) -> Optional[int]:
+    request = Request(url, method="HEAD")
+    with urlopen(request, timeout=30) as response:
+        content_length = response.headers.get("Content-Length")
+    if not content_length:
+        return None
+    return int(content_length)
+
+
+def _is_model_file_valid(path: Path) -> bool:
+    if not path.exists() or path.suffix != ".safetensors":
+        return True
+    try:
+        from safetensors import safe_open
+
+        with safe_open(str(path), framework="pt", device="cpu") as handle:
+            handle.keys()
+        return True
+    except Exception:
+        return False
+
+
+def _format_size(num_bytes: int) -> str:
+    value = float(num_bytes)
+    units = ["B", "KB", "MB", "GB", "TB"]
+    for unit in units:
+        if value < 1024.0 or unit == units[-1]:
+            return f"{value:.1f}{unit}"
+        value /= 1024.0
+
+
 def _resolve_device(configured_device: str) -> str:
     if configured_device and configured_device.lower() != "auto":
         return configured_device
@@ -253,6 +323,15 @@ def _resolve_device(configured_device: str) -> str:
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return "mps"
     return "cpu"
+
+
+def _resolve_keepalive_seconds(device: str) -> float:
+    configured = ENV_CONFIG.get("HUNYUAN3D_KEEPALIVE_SEC")
+    if configured not in (None, ""):
+        return float(configured)
+    if device == "mps":
+        return 0.0
+    return 900.0
 
 
 def _patch_shapegen_init_for_optional_postprocessors() -> None:
