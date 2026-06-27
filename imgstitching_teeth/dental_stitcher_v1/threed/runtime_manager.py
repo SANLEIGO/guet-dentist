@@ -16,7 +16,7 @@ RUNTIME_DIR = ROOT_DIR / ".runtime" / "hunyuan3d"
 LOG_DIR = RUNTIME_DIR / "logs"
 REPO_DIR = ROOT_DIR / "third_party" / "Hunyuan3D-2"
 MODELS_DIR = RUNTIME_DIR / "models"
-DEFAULT_MODEL_DIR = MODELS_DIR / "Hunyuan3D-2mv"
+DEFAULT_MODEL_DIR = MODELS_DIR / "Hunyuan3D-2.1"
 TASK_LOG_PATH = LOG_DIR / "task.log"
 SERVICE_LOG_PATH = LOG_DIR / "service.log"
 TASK_PID_PATH = RUNTIME_DIR / "task.pid"
@@ -201,24 +201,16 @@ def _preview_text(path: Path, head_chars: int = 2000, tail_chars: int = 3000) ->
 
 def _model_weights_exist(model_root: Path) -> bool:
     candidate_files = [
-        model_root / "hunyuan3d-dit-v2-mv-turbo" / "model.fp16.safetensors",
-        model_root / "hunyuan3d-dit-v2-mv-turbo" / "model.fp16.ckpt",
-        model_root / "hunyuan3d-dit-v2-mv-fast" / "model.fp16.safetensors",
-        model_root / "hunyuan3d-dit-v2-mv-fast" / "model.fp16.ckpt",
-        model_root / "hunyuan3d-dit-v2-mv" / "model.safetensors",
-        model_root / "hunyuan3d-dit-v2-mv" / "model.ckpt",
+        model_root / "hunyuan3d-dit-v2-1" / "model.fp16.ckpt",
+        model_root / "hunyuan3d-dit-v2-1" / "model.fp16.safetensors",
     ]
     return any(path.exists() for path in candidate_files)
 
 
 def _inspect_model_state(model_root: Path) -> tuple[str, str]:
     candidate_files = [
-        model_root / "hunyuan3d-dit-v2-mv-turbo" / "model.fp16.safetensors",
-        model_root / "hunyuan3d-dit-v2-mv-turbo" / "model.fp16.ckpt",
-        model_root / "hunyuan3d-dit-v2-mv-fast" / "model.fp16.safetensors",
-        model_root / "hunyuan3d-dit-v2-mv-fast" / "model.fp16.ckpt",
-        model_root / "hunyuan3d-dit-v2-mv" / "model.safetensors",
-        model_root / "hunyuan3d-dit-v2-mv" / "model.ckpt",
+        model_root / "hunyuan3d-dit-v2-1" / "model.fp16.ckpt",
+        model_root / "hunyuan3d-dit-v2-1" / "model.fp16.safetensors",
     ]
 
     for path in candidate_files:
@@ -281,15 +273,16 @@ def _build_running_task_hint(task_log_tail: str) -> str:
         return "正在安装 Hunyuan3D 运行环境，请稍等。"
     if "准备 Hunyuan3D 代码仓库" in task_log_tail or "Step 1/3" in task_log_tail:
         return "正在准备 Hunyuan3D 代码和运行环境。"
-    if "准备启动本地 Hunyuan3D bridge 服务" in task_log_tail or "服务启动命令已提交" in task_log_tail:
+    if "准备启动本地 Hunyuan3D 单图 bridge 服务" in task_log_tail or "服务启动命令已提交" in task_log_tail:
         return "正在启动 Hunyuan3D 服务。"
     return _summarize_task_message(task_log_tail)
 
 
 def _task_log_indicates_model_download(task_log_tail: str) -> bool:
     return (
-        "开始下载 Hunyuan3D-2mv 模型" in task_log_tail
+        "开始下载 Hunyuan3D-2.1 模型" in task_log_tail
         or "下载 model.fp16.safetensors" in task_log_tail
+        or "下载 model.fp16.ckpt" in task_log_tail
         or "Resuming transfer" in task_log_tail
         or "% Total" in task_log_tail
         or "Dload  Upload" in task_log_tail

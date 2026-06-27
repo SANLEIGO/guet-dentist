@@ -24,7 +24,7 @@ class HunyuanServiceConfig:
     model_path: str
     subfolder: str
     device: str
-    service_mode: str = "mv_bridge"
+    service_mode: str = "single_image"
     request_timeout_sec: float = 20.0
     poll_interval_sec: float = 3.0
 
@@ -32,10 +32,10 @@ class HunyuanServiceConfig:
     def from_env(cls) -> "HunyuanServiceConfig":
         return cls(
             service_url=str(_ENV_CONFIG.get("HUNYUAN3D_SERVICE_URL", "http://127.0.0.1:8081")).rstrip("/"),
-            model_path=str(_ENV_CONFIG.get("HUNYUAN3D_MODEL_PATH", "tencent/Hunyuan3D-2mv")),
-            subfolder=str(_ENV_CONFIG.get("HUNYUAN3D_SUBFOLDER", "hunyuan3d-dit-v2-mv-turbo")),
+            model_path=str(_ENV_CONFIG.get("HUNYUAN3D_MODEL_PATH", "tencent/Hunyuan3D-2.1")),
+            subfolder=str(_ENV_CONFIG.get("HUNYUAN3D_SUBFOLDER", "hunyuan3d-dit-v2-1")),
             device=str(_ENV_CONFIG.get("HUNYUAN3D_DEVICE", "auto")),
-            service_mode=str(_ENV_CONFIG.get("HUNYUAN3D_SERVICE_MODE", "mv_bridge")),
+            service_mode=str(_ENV_CONFIG.get("HUNYUAN3D_SERVICE_MODE", "single_image")),
             request_timeout_sec=float(_ENV_CONFIG.get("HUNYUAN3D_REQUEST_TIMEOUT_SEC", 20.0)),
             poll_interval_sec=float(_ENV_CONFIG.get("HUNYUAN3D_POLL_INTERVAL_SEC", 3.0)),
         )

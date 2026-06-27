@@ -312,9 +312,7 @@ def _extract_instances(image: np.ndarray, method: str) -> InstanceSegmentationRe
 
         try:
             # 运行YOLOv8预测
-            import cv2
-            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            results = model.predict(rgb, imgsz=960, conf=0.1, verbose=False)
+            results = model.predict(image, imgsz=960, conf=0.1, verbose=False, retina_masks=True)
 
             # 检查是否有检测结果
             if not results or len(results) == 0:
@@ -324,7 +322,12 @@ def _extract_instances(image: np.ndarray, method: str) -> InstanceSegmentationRe
                 return _empty_instance_result(image, "yolo_no_masks_detected")
 
             # 提取实例信息
-            instance_result = extract_teeth_instances_from_yolo(results, image, apply_grabcut=False)
+            instance_result = extract_teeth_instances_from_yolo(
+                results,
+                image,
+                apply_grabcut=False,
+                merge_overlaps=False,
+            )
 
             # 检查实例数量
             if len(instance_result.instances) < 4:

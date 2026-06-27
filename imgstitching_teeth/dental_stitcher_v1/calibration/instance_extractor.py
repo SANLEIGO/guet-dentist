@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import cv2
@@ -27,6 +27,8 @@ class ToothInstance:
     confidence: float          # 检测置信度
     width: int                 # bbox宽度（像素）
     height: int                # bbox高度（像素）
+    source_instance_ids: list[int] = field(default_factory=list)
+    source_labels: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -42,7 +44,10 @@ class InstanceSegmentationResult:
 def extract_teeth_instances_from_yolo(
     results: Any,
     image: np.ndarray,
-    apply_grabcut: bool = False
+    apply_grabcut: bool = False,
+    merge_overlaps: bool = False,
+    merge_overlap_threshold: float = 0.55,
+    merge_bbox_iou_threshold: float = 0.20,
 ) -> InstanceSegmentationResult:
     """
     从YOLOv8结果提取所有牙齿实例信息
@@ -70,14 +75,6 @@ def extract_teeth_instances_from_yolo(
     masks_data = masks.data.detach().cpu().numpy()  # [N, H, W] 实例掩膜
     boxes = result.boxes                           # YOLOv8 Boxes对象
 
-    # 提取boxes数据（归一化坐标）
-    if hasattr(boxes, 'xyxyn'):
-        boxes_xyxyn = boxes.xyxyn.detach().cpu().numpy()  # [N, 4] 归一化坐标
-    else:
-        boxes_xyxy = boxes.xyxy.detach().cpu().numpy()    # [N, 4] 像素坐标
-        h, w = image.shape[:2]
-        boxes_xyxyn = boxes_xyxy / np.array([w, h, w, h])
-
     # 提取类别和置信度
     classes = boxes.cls.detach().cpu().numpy()     # [N] 类别ID
     confidences = boxes.conf.detach().cpu().numpy()  # [N] 置信度
@@ -85,21 +82,25 @@ def extract_teeth_instances_from_yolo(
 
     # 图像尺寸
     h, w = image.shape[:2]
+    boxes_xyxy = boxes.xyxy.detach().cpu().numpy() if hasattr(boxes, "xyxy") else None
 
     # 构建ToothInstance列表
     instances = []
     for i in range(masks_data.shape[0]):
         # 提取单实例mask
-        mask_i = (masks_data[i] > 0.5).astype(np.uint8) * 255
+        mask_i = _normalize_instance_mask((masks_data[i] > 0.5).astype(np.uint8) * 255, (h, w))
 
-        # 边界框（归一化坐标转像素坐标）
-        box_norm = boxes_xyxyn[i]  # [x1_n, y1_n, x2_n, y2_n]
-        bbox_pixel = np.array([
-            box_norm[0] * w,  # x1
-            box_norm[1] * h,  # y1
-            box_norm[2] * w,  # x2
-            box_norm[3] * h   # y2
-        ])
+        # 边界框直接使用原图像素坐标，避免和低分辨率mask错位
+        if boxes_xyxy is not None:
+            x1, y1, x2, y2 = boxes_xyxy[i][:4]
+            bbox_pixel = np.array([
+                float(np.clip(x1, 0, w - 1)),
+                float(np.clip(y1, 0, h - 1)),
+                float(np.clip(x2, 0, w - 1)),
+                float(np.clip(y2, 0, h - 1)),
+            ])
+        else:
+            bbox_pixel = _bbox_from_mask(mask_i)
 
         # 计算中心点
         center = compute_mask_center(mask_i)
@@ -128,9 +129,18 @@ def extract_teeth_instances_from_yolo(
             aspect_ratio=aspect_ratio,
             confidence=float(confidences[i]),
             width=width,
-            height=height
+            height=height,
+            source_instance_ids=[i],
+            source_labels=[str(names[int(classes[i])])],
         )
         instances.append(instance)
+
+    if merge_overlaps:
+        instances = merge_overlapping_instances(
+            instances,
+            overlap_threshold=merge_overlap_threshold,
+            bbox_iou_threshold=merge_bbox_iou_threshold,
+        )
 
     # 按x坐标排序（从左到右）
     instances = sort_instances_by_position(instances)
@@ -195,6 +205,51 @@ def sort_instances_by_position(instances: list[ToothInstance]) -> list[ToothInst
         排序后的实例列表
     """
     return sorted(instances, key=lambda inst: inst.center[0])
+
+
+def merge_overlapping_instances(
+    instances: list[ToothInstance],
+    overlap_threshold: float = 0.55,
+    bbox_iou_threshold: float = 0.20,
+) -> list[ToothInstance]:
+    """Merge raw AlphaDent masks that strongly overlap into tooth candidates."""
+    if len(instances) < 2:
+        return instances
+
+    parent = list(range(len(instances)))
+
+    def find(idx: int) -> int:
+        while parent[idx] != idx:
+            parent[idx] = parent[parent[idx]]
+            idx = parent[idx]
+        return idx
+
+    def union(i: int, j: int) -> None:
+        ri = find(i)
+        rj = find(j)
+        if ri != rj:
+            parent[rj] = ri
+
+    for i in range(len(instances)):
+        for j in range(i + 1, len(instances)):
+            if _instance_overlap_ratio(instances[i], instances[j]) >= overlap_threshold:
+                union(i, j)
+                continue
+            if _bbox_iou(instances[i].bbox, instances[j].bbox) >= bbox_iou_threshold:
+                union(i, j)
+
+    groups: dict[int, list[ToothInstance]] = {}
+    for idx, instance in enumerate(instances):
+        groups.setdefault(find(idx), []).append(instance)
+
+    merged: list[ToothInstance] = []
+    for members in groups.values():
+        if len(members) == 1:
+            merged.append(members[0])
+            continue
+        merged.append(_merge_instance_group(members))
+
+    return merged
 
 
 def visualize_instances_with_labels(
@@ -269,6 +324,79 @@ def visualize_instances_with_labels(
         )
 
     return overlay
+
+
+def _normalize_instance_mask(mask: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
+    if mask.shape[:2] != target_shape:
+        mask = cv2.resize(mask, (target_shape[1], target_shape[0]), interpolation=cv2.INTER_NEAREST)
+    return mask.astype(np.uint8)
+
+
+def _bbox_from_mask(mask: np.ndarray) -> np.ndarray:
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        return np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    return np.array([float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())], dtype=np.float32)
+
+
+def _bbox_iou(a: np.ndarray, b: np.ndarray) -> float:
+    ax1, ay1, ax2, ay2 = [float(v) for v in a]
+    bx1, by1, bx2, by2 = [float(v) for v in b]
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    inter_w = max(0.0, inter_x2 - inter_x1)
+    inter_h = max(0.0, inter_y2 - inter_y1)
+    intersection = inter_w * inter_h
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - intersection
+    if union <= 0.0:
+        return 0.0
+    return float(intersection / union)
+
+
+def _instance_overlap_ratio(a: ToothInstance, b: ToothInstance) -> float:
+    mask_a = a.mask > 0
+    mask_b = b.mask > 0
+    intersection = int(np.count_nonzero(mask_a & mask_b))
+    if intersection <= 0:
+        return 0.0
+    return float(intersection / max(1, min(a.area, b.area)))
+
+
+def _merge_instance_group(members: list[ToothInstance]) -> ToothInstance:
+    union_mask = np.zeros_like(members[0].mask, dtype=np.uint8)
+    source_instance_ids: list[int] = []
+    source_labels: list[str] = []
+    best_member = max(members, key=lambda item: item.confidence)
+    for member in members:
+        union_mask = np.maximum(union_mask, member.mask)
+        source_instance_ids.extend(member.source_instance_ids or [member.instance_id])
+        source_labels.extend(member.source_labels or [member.class_name])
+
+    bbox = _bbox_from_mask(union_mask)
+    center = compute_mask_center(union_mask)
+    area = cv2.countNonZero(union_mask)
+    width = int(max(0.0, bbox[2] - bbox[0]))
+    height = int(max(0.0, bbox[3] - bbox[1]))
+
+    return ToothInstance(
+        instance_id=best_member.instance_id,
+        class_id=best_member.class_id,
+        class_name=best_member.class_name,
+        bbox=bbox,
+        center=center,
+        mask=union_mask,
+        area=area,
+        aspect_ratio=width / max(height, 1),
+        confidence=max(member.confidence for member in members),
+        width=width,
+        height=height,
+        source_instance_ids=sorted(dict.fromkeys(source_instance_ids)),
+        source_labels=sorted(dict.fromkeys(source_labels)),
+    )
 
 
 def _grabcut_refine_instance(

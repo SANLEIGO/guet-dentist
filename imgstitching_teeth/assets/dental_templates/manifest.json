@@ -1,0 +1,24 @@
+{
+  "assets": [
+    {
+      "asset_id": "dental_arches_sketchfab_cc_by_v1",
+      "title": "",
+      "file": "dental_arches.glb",
+      "license_file": "dental_arches_LICENSE.txt",
+      "source_url": "https://sketchfab.com/3d-models/dental-arches-a17fda74c85344709624e9e39a6634b6",
+      "author": "",
+      "license": "CC-BY-4.0",
+      "integration_notes": "Complete upper/lower dental arch visual baseline. The downloaded GLB has 10 meshes, not one mesh per FDI tooth, so per-tooth edits currently require a separate FDI mapping or tooth segmentation step."
+    },
+    {
+      "asset_id": "segmented_dental_arch_tooth_nodes_v1",
+      "title": "",
+      "file": "segmented_arch.glb",
+      "license_file": "dental_arches_LICENSE.txt",
+      "source_url": "generated locally from dental_arches.glb",
+      "author": "",
+      "license": "CC-BY-4.0",
+      "integration_notes": "Generated GLB with independent tooth_11 ... tooth_48 nodes so caries can recolor a tooth mesh and missing teeth can hide the tooth node directly."
+    }
+  ]
+}

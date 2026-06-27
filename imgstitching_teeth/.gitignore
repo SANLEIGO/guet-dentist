@@ -1,0 +1,41 @@
+# OS / editor
+.DS_Store
+.idea/
+
+# Python environments / caches
+.venv/
+.venv*/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Local runtime / model downloads
+.runtime/
+gradio_cache/
+third_party/stable-point-aware-3d/
+
+# Local logs / pid / temp
+*.log
+*.pid
+logs/
+
+# Generated images / reports
+cleaned_final/
+cleaned_results/
+diagnostics_teeth_only_v1.json
+segmentation_report*.json
+stitched_teeth_only_v1*.png
+
+# Large local model artifacts
+pts/*.onnx
+pts/*.pt
+pts/*.pth
+*.glb
+*.ckpt
+*.safetensors
+!pts/README.md
+!pts/UNET_README.md
+
+# Local env config
+.env

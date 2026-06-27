@@ -140,7 +140,10 @@ def segment_teeth_with_instances(
     method: str = "alphadent",
     use_grabcut: bool = False,  # 实例提取默认不使用GrabCut（更快速）
     use_enhancement: bool = False,
-    enhancement_level: float = 3.0
+    enhancement_level: float = 3.0,
+    merge_overlaps: bool = True,
+    conf_threshold: float = 0.10,
+    imgsz: int = 960,
 ):
     """Segment teeth and extract individual instances (for auto-calibration).
 
@@ -150,6 +153,9 @@ def segment_teeth_with_instances(
         use_grabcut: Whether to apply GrabCut refinement to each instance
         use_enhancement: Whether to apply CLAHE enhancement
         enhancement_level: CLAHE clip limit
+        merge_overlaps: Whether to merge heavily-overlapping raw masks into tooth candidates
+        conf_threshold: AlphaDent confidence threshold
+        imgsz: AlphaDent inference size
 
     Returns:
         InstanceSegmentationResult with individual tooth instances
@@ -175,11 +181,17 @@ def segment_teeth_with_instances(
             return _empty_instance_result(image, error_msg)
 
         try:
-            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            results = model.predict(rgb, imgsz=960, conf=0.1, verbose=False)
+            # Keep OpenCV BGR order here. In local verification on panoramic photos,
+            # converting to RGB reduced the number of recovered tooth candidates.
+            results = model.predict(image, imgsz=imgsz, conf=conf_threshold, verbose=False, retina_masks=True)
 
             # 提取实例信息
-            return extract_teeth_instances_from_yolo(results, image, apply_grabcut=use_grabcut)
+            return extract_teeth_instances_from_yolo(
+                results,
+                image,
+                apply_grabcut=use_grabcut,
+                merge_overlaps=merge_overlaps,
+            )
 
         except Exception as exc:
             return _empty_instance_result(image, f"inference_failed: {exc}")

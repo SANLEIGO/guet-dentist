@@ -26,7 +26,7 @@ from dental_stitcher_v1.threed import (
     HunyuanServiceClient,
     HunyuanServiceConfig,
     HunyuanRuntimeManager,
-    build_pseudo_multiview_pack,
+    Prepared3DAsset,
     derive_mask_from_image,
     prepare_image_for_hunyuan3d,
 )
@@ -114,6 +114,361 @@ def _render_glb_preview(glb_bytes: bytes, height: int = 560) -> None:
     </div>
     """
     components.html(html, height=height + 12)
+
+
+def _clear_hunyuan_job_state() -> None:
+    for key in (
+        "hunyuan_job_uid",
+        "hunyuan_job_status",
+        "hunyuan_job_message",
+        "hunyuan_job_result_bytes",
+        "hunyuan_job_result_path",
+    ):
+        st.session_state.pop(key, None)
+
+
+def _reset_hunyuan_generation_state(clear_prepared_asset: bool = False) -> None:
+    if clear_prepared_asset:
+        st.session_state.pop("prepared_3d_asset", None)
+    st.session_state.pop("hunyuan_input_asset", None)
+    st.session_state.pop("hunyuan_input_source_image", None)
+    st.session_state.pop("hunyuan_input_source_name", None)
+    st.session_state.pop("hunyuan_input_source_label", None)
+    _clear_hunyuan_job_state()
+
+
+def _uploaded_image_to_cv2(uploaded) -> np.ndarray:
+    data = np.frombuffer(uploaded.getvalue(), dtype=np.uint8)
+    image = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+    if image is None:
+        raise ValueError(f"无法读取图像文件：{uploaded.name}")
+    if image.ndim == 2:
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    if image.ndim != 3 or image.shape[2] not in {3, 4}:
+        raise ValueError(f"不支持的图像通道格式：{uploaded.name}")
+    return image
+
+
+def _image_for_display(image: np.ndarray) -> np.ndarray:
+    if image.ndim == 2:
+        return image
+    if image.shape[2] == 4:
+        return cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA)
+    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+
+def _build_manual_hunyuan_input_asset(uploaded, target_size: int = 512) -> tuple[Prepared3DAsset, np.ndarray]:
+    image = _uploaded_image_to_cv2(uploaded)
+    if image.ndim == 3 and image.shape[2] == 4:
+        source_bgr = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+        source_mask = image[:, :, 3]
+    else:
+        source_bgr = image
+        source_mask = None
+    prepared_asset = prepare_image_for_hunyuan3d(
+        source_bgr,
+        mask=source_mask,
+        target_size=target_size,
+        padding_ratio=0.12,
+    )
+    return prepared_asset, source_bgr
+
+
+def _render_hunyuan_submission_panel(
+    service_config: HunyuanServiceConfig,
+    prepared_asset: Prepared3DAsset,
+    region_label: str,
+    source_label: str,
+    source_name: str,
+    source_image: np.ndarray,
+) -> None:
+    arch_slug = _slugify_arch_label(region_label)
+    current_job_uid = st.session_state.get("hunyuan_job_uid")
+    current_job_status = st.session_state.get("hunyuan_job_status")
+    current_job_message = st.session_state.get("hunyuan_job_message")
+    result_bytes = st.session_state.get("hunyuan_job_result_bytes")
+
+    st.markdown("#### 当前单图输入")
+    st.caption(f"当前来源: {source_label} | 文件: {source_name}")
+    col_src, col_ready = st.columns(2)
+    with col_src:
+        st.markdown("#### 原始来源图")
+        st.image(_image_for_display(resize_for_display(source_image)), width="stretch")
+    with col_ready:
+        st.markdown("#### 3D-ready 输入图")
+        st.image(bgr_to_rgb(prepared_asset.bgr_image), width="stretch")
+
+    st.markdown("#### 3D 输入元数据")
+    st.dataframe(
+        [{
+            "原图尺寸": f"{prepared_asset.metadata['source_shape'][1]} x {prepared_asset.metadata['source_shape'][0]}",
+            "输出尺寸": prepared_asset.metadata["target_size"],
+            "原图覆盖率": f"{prepared_asset.metadata['source_mask_coverage']:.1%}",
+            "输出覆盖率": f"{prepared_asset.metadata['prepared_mask_coverage']:.1%}",
+            "裁剪框": ", ".join(map(str, prepared_asset.metadata["source_bbox_xyxy"])),
+            "放置框": ", ".join(map(str, prepared_asset.metadata["placed_bbox_xyxy"])),
+        }],
+        width="stretch",
+    )
+
+    dl_col1, dl_col2, dl_col3 = st.columns(3)
+    with dl_col1:
+        st.download_button(
+            "⬇️ 下载 3D-ready PNG",
+            data=prepared_asset.png_bytes(transparent=False),
+            file_name=f"hunyuan3d_input_{arch_slug}.png",
+            mime="image/png",
+            width="stretch",
+        )
+    with dl_col2:
+        st.download_button(
+            "⬇️ 下载透明 PNG",
+            data=prepared_asset.png_bytes(transparent=True),
+            file_name=f"hunyuan3d_input_rgba_{arch_slug}.png",
+            mime="image/png",
+            width="stretch",
+        )
+    with dl_col3:
+        st.download_button(
+            "⬇️ 下载预处理元数据",
+            data=prepared_asset.metadata_bytes(),
+            file_name=f"hunyuan3d_input_metadata_{arch_slug}.json",
+            mime="application/json",
+            width="stretch",
+        )
+
+    st.markdown("#### Hunyuan3D-2.1 提交")
+    should_autopoll = bool(current_job_uid) and not result_bytes and current_job_status not in {"completed", "error"}
+    if should_autopoll:
+        st_autorefresh(interval=5000, key="hunyuan_single_job_autorefresh")
+        try:
+            client = HunyuanServiceClient(service_config)
+            job_status = client.get_job_status(current_job_uid)
+            st.session_state.hunyuan_job_status = job_status.status
+            if job_status.model_bytes:
+                st.session_state.hunyuan_job_result_bytes = job_status.model_bytes
+                st.session_state.hunyuan_job_result_path = str(
+                    _persist_hunyuan_result(current_job_uid, job_status.model_bytes, arch_slug=arch_slug)
+                )
+            if job_status.message:
+                st.session_state.hunyuan_job_message = job_status.message
+            current_job_status = job_status.status
+            current_job_message = job_status.message
+            result_bytes = job_status.model_bytes or result_bytes
+        except Exception as exc:
+            st.warning(f"自动轮询 3D 任务状态失败：{exc}")
+
+    submit_col, refresh_col = st.columns(2)
+    submit_disabled = bool(current_job_uid) and current_job_status not in {None, "completed", "error"}
+    with submit_col:
+        if st.button("提交到 Hunyuan3D-2.1", key="submit_hunyuan_single", type="primary", width="stretch", disabled=submit_disabled):
+            try:
+                client = HunyuanServiceClient(service_config)
+                job_uid = client.submit_image_async(
+                    prepared_asset.bgra_image,
+                    seed=1234,
+                    num_inference_steps=_default_hunyuan_steps(service_config.subfolder),
+                    guidance_scale=5.0,
+                    octree_resolution=256,
+                    texture=False,
+                )
+                st.session_state.hunyuan_job_uid = job_uid
+                st.session_state.hunyuan_job_status = "submitted"
+                st.session_state.hunyuan_job_message = None
+                st.session_state.hunyuan_job_result_bytes = None
+                st.session_state.hunyuan_job_result_path = None
+            except Exception as exc:
+                st.error(f"❌ 提交 Hunyuan3D-2.1 任务失败：{exc}")
+    with refresh_col:
+        if st.button("刷新 3D 任务状态", key="refresh_hunyuan_single_status", width="stretch"):
+            job_uid = st.session_state.get("hunyuan_job_uid")
+            if not job_uid:
+                st.warning("⚠️ 当前没有待查询的 3D 任务。")
+            else:
+                try:
+                    client = HunyuanServiceClient(service_config)
+                    job_status = client.get_job_status(job_uid)
+                    st.session_state.hunyuan_job_status = job_status.status
+                    if job_status.model_bytes:
+                        st.session_state.hunyuan_job_result_bytes = job_status.model_bytes
+                        st.session_state.hunyuan_job_result_path = str(
+                            _persist_hunyuan_result(job_uid, job_status.model_bytes, arch_slug=arch_slug)
+                        )
+                    if job_status.message:
+                        st.session_state.hunyuan_job_message = job_status.message
+                except Exception as exc:
+                    st.error(f"❌ 查询 Hunyuan3D-2.1 状态失败：{exc}")
+
+    current_job_uid = st.session_state.get("hunyuan_job_uid")
+    current_job_status = st.session_state.get("hunyuan_job_status")
+    current_job_message = st.session_state.get("hunyuan_job_message")
+    current_job_result_path = st.session_state.get("hunyuan_job_result_path")
+    if current_job_uid:
+        st.caption(f"当前任务 UID: {current_job_uid} | 状态: {current_job_status or 'submitted'}")
+    if submit_disabled:
+        st.caption("当前 3D 服务一次只处理一个任务，请等待本次任务完成或失败后再提交新的任务。")
+    if should_autopoll:
+        st.info("任务进行中，页面会每 5 秒自动轮询一次。")
+    if current_job_status == "error" and current_job_message:
+        st.error(f"❌ Hunyuan3D-2.1 任务失败：{current_job_message}")
+
+    result_bytes = st.session_state.get("hunyuan_job_result_bytes")
+    if not result_bytes and current_job_result_path:
+        result_path_obj = Path(current_job_result_path)
+        if result_path_obj.exists():
+            result_bytes = result_path_obj.read_bytes()
+            st.session_state.hunyuan_job_result_bytes = result_bytes
+    if result_bytes:
+        st.success("✅ 已收到 Hunyuan3D-2.1 输出 mesh。")
+        if current_job_result_path:
+            st.caption(f"结果已保存到: {current_job_result_path}")
+        st.markdown("#### GLB 在线预览")
+        _render_glb_preview(result_bytes)
+        st.download_button(
+            "⬇️ 下载 3D Mesh (GLB)",
+            data=result_bytes,
+            file_name=f"hunyuan3d_demo_{arch_slug}.glb",
+            mime="model/gltf-binary",
+            width="stretch",
+        )
+
+
+def _render_hunyuan_generation_panel(
+    *,
+    region_label: str,
+    prepared_source: Optional[np.ndarray],
+    prepared_mask: Optional[np.ndarray],
+) -> None:
+    st.divider()
+    st.markdown("### 🧊 第 3 步: Hunyuan3D-2.1 单图生成")
+    if prepared_source is not None and prepared_mask is not None:
+        st.info(
+            """
+            当前 3D Demo 支持两条单图输入链路：
+            1. 从当前拼接/全景牙弓结果自动准备 3D-ready PNG，再直接提交到 Hunyuan3D-2.1。
+            2. 手动上传一张牙齿全景图，做同样的单图预处理后直接提交。
+            """
+        )
+    else:
+        st.info("当前还没有自动生成用的牙弓结果，你仍然可以直接手动上传一张牙齿全景图。")
+
+    service_config = HunyuanServiceConfig.from_env()
+    probe_button_col, probe_info_col = st.columns([1, 2])
+    with probe_button_col:
+        if st.button("检测 Hunyuan3D 服务", key="probe_hunyuan3d_service", width="stretch"):
+            probe_result = HunyuanServiceClient(service_config).probe()
+            st.session_state.hunyuan_probe_result = probe_result
+    with probe_info_col:
+        st.caption(
+            f"服务地址: {service_config.service_url} | 模型: {service_config.model_path} | 子目录: {service_config.subfolder}"
+        )
+
+    probe_result = st.session_state.get("hunyuan_probe_result")
+    if probe_result is not None:
+        if probe_result.reachable:
+            st.success(f"✅ Hunyuan3D 服务可访问：{probe_result.url}（状态：{probe_result.status}）")
+        else:
+            st.warning(f"⚠️ Hunyuan3D 服务暂不可访问：{probe_result.message}")
+
+    tab_labels: list[str] = []
+    has_auto_source = prepared_source is not None and prepared_mask is not None
+    if has_auto_source:
+        tab_labels.append("自动准备单图")
+    tab_labels.append("手动上传单图")
+    tabs = st.tabs(tab_labels)
+
+    tab_index = 0
+    if has_auto_source:
+        with tabs[tab_index]:
+            prep_btn_col, prep_info_col = st.columns([1, 2])
+            with prep_btn_col:
+                if st.button("准备 3D 输入", key="prepare_hunyuan_input", type="secondary", width="stretch"):
+                    try:
+                        prepared_asset = prepare_image_for_hunyuan3d(
+                            prepared_source,
+                            mask=prepared_mask,
+                            target_size=512,
+                            padding_ratio=0.12,
+                        )
+                        _reset_hunyuan_generation_state(clear_prepared_asset=True)
+                        st.session_state.prepared_3d_asset = prepared_asset
+                    except Exception as exc:
+                        st.error(f"❌ 3D 输入准备失败：{exc}")
+            with prep_info_col:
+                meta = st.session_state.get("stitched_for_3d_meta", {})
+                st.caption(
+                    "输入来源: "
+                    f"{meta.get('region_label', 'unknown')} | "
+                    f"可信度: {meta.get('confidence_level', 'unknown')} | "
+                    f"严格牙齿输出: {'是' if meta.get('strict_teeth_only', True) else '否'}"
+                )
+
+            prepared_asset = st.session_state.get("prepared_3d_asset")
+            if prepared_asset is not None:
+                if st.button("使用当前 3D-ready 单图", key="use_auto_single_image", type="secondary", width="stretch"):
+                    _reset_hunyuan_generation_state()
+                    st.session_state.hunyuan_input_asset = prepared_asset
+                    st.session_state.hunyuan_input_source_image = prepared_source.copy()
+                    st.session_state.hunyuan_input_source_name = f"auto_prepared_{_slugify_arch_label(region_label)}.png"
+                    st.session_state.hunyuan_input_source_label = "自动预处理单图"
+        tab_index += 1
+
+    with tabs[tab_index]:
+        st.caption("手动入口接收 1 张牙齿全景图。支持 PNG/JPG/BMP/TIFF；如果上传透明 PNG，会直接保留 alpha。")
+        manual_upload = st.file_uploader(
+            "上传牙齿全景图",
+            type=["png", "jpg", "jpeg", "bmp", "tif", "tiff"],
+            accept_multiple_files=False,
+            key="hunyuan_manual_single_image",
+        )
+
+        manual_image = None
+        manual_error = None
+        if manual_upload is not None:
+            try:
+                manual_image = _uploaded_image_to_cv2(manual_upload)
+            except Exception as exc:
+                manual_error = str(exc)
+                st.error(f"❌ 手动单图读取失败：{manual_error}")
+
+        if manual_image is not None:
+            st.image(
+                _image_for_display(resize_for_display(manual_image, max_width=420, max_height=260)),
+                caption=manual_upload.name,
+                width="stretch",
+            )
+
+        if st.button(
+            "导入手动单图",
+            key="build_manual_single_image",
+            type="secondary",
+            width="stretch",
+            disabled=(manual_upload is None or manual_error is not None),
+        ):
+            try:
+                manual_asset, source_bgr = _build_manual_hunyuan_input_asset(manual_upload)
+                _reset_hunyuan_generation_state()
+                st.session_state.hunyuan_input_asset = manual_asset
+                st.session_state.hunyuan_input_source_image = source_bgr
+                st.session_state.hunyuan_input_source_name = manual_upload.name
+                st.session_state.hunyuan_input_source_label = "手动上传单图"
+                st.success("✅ 已导入手动单图，下面可以直接提交到 Hunyuan3D-2.1。")
+            except Exception as exc:
+                st.error(f"❌ 手动单图导入失败：{exc}")
+
+    prepared_asset = st.session_state.get("hunyuan_input_asset")
+    source_image = st.session_state.get("hunyuan_input_source_image")
+    source_name = st.session_state.get("hunyuan_input_source_name")
+    source_label = st.session_state.get("hunyuan_input_source_label")
+    if prepared_asset is not None and source_image is not None and source_name and source_label:
+        _render_hunyuan_submission_panel(
+            service_config,
+            prepared_asset,
+            region_label,
+            source_label,
+            source_name,
+            source_image,
+        )
 
 
 def _render_hunyuan_runtime_panel() -> None:
@@ -385,6 +740,11 @@ def main() -> None:
     if source_mode == "上传图像":
         if not uploads:
             st.info("👈 请先在左侧上传图像")
+            _render_hunyuan_generation_panel(
+                region_label="manual_import",
+                prepared_source=st.session_state.get("stitched_for_3d_image"),
+                prepared_mask=st.session_state.get("stitched_for_3d_mask"),
+            )
             return
         packets = load_uploaded_images(uploads)
     else:
@@ -397,6 +757,11 @@ def main() -> None:
 
     if len(packets) == 0:
         st.error("❌ 没有读取到有效图像文件")
+        _render_hunyuan_generation_panel(
+            region_label="manual_import",
+            prepared_source=st.session_state.get("stitched_for_3d_image"),
+            prepared_mask=st.session_state.get("stitched_for_3d_mask"),
+        )
         return
 
     st.markdown(f"### 📸 已上传 {len(packets)} 张图像")
@@ -442,12 +807,7 @@ def main() -> None:
             st.session_state.pop("stitched_for_3d_image", None)
             st.session_state.pop("stitched_for_3d_mask", None)
             st.session_state.pop("stitched_for_3d_meta", None)
-            st.session_state.pop("prepared_3d_asset", None)
-            st.session_state.pop("pseudo_multiview_pack", None)
-            st.session_state.pop("hunyuan_job_uid", None)
-            st.session_state.pop("hunyuan_job_status", None)
-            st.session_state.pop("hunyuan_job_message", None)
-            st.session_state.pop("hunyuan_job_result_bytes", None)
+            _reset_hunyuan_generation_state(clear_prepared_asset=True)
             seg_results = []
             seg_metrics = []
 
@@ -504,10 +864,20 @@ def main() -> None:
                     with st.expander("查看详细错误信息"):
                         for msg in error_messages:
                             st.text(msg)
+                _render_hunyuan_generation_panel(
+                    region_label=region_label,
+                    prepared_source=st.session_state.get("stitched_for_3d_image"),
+                    prepared_mask=st.session_state.get("stitched_for_3d_mask"),
+                )
                 st.stop()
 
             if len(seg_results) == 0:
                 st.error("❌ 没有成功分割任何图像，请检查模型配置和图像质量。")
+                _render_hunyuan_generation_panel(
+                    region_label=region_label,
+                    prepared_source=st.session_state.get("stitched_for_3d_image"),
+                    prepared_mask=st.session_state.get("stitched_for_3d_mask"),
+                )
                 st.stop()
 
             st.session_state.seg_results = seg_results
@@ -646,42 +1016,48 @@ def main() -> None:
         st.divider()
         st.markdown("### 🦷 第 2 步: 牙齿主体拼接")
 
-        if len(packets) < 2:
-            st.warning("⚠️ 至少需要 2 张图像才能进行拼接")
-            st.info("💡 请上传更多图像后重试")
-            return
+        single_panorama_mode = len(packets) == 1
+        if single_panorama_mode:
+            st.info("检测到仅 1 张图像：将按单张全景图处理，跳过二维拼接，直接进入后续去噪、下载和三维准备流程。")
+            selected_indices = [0]
+        else:
+            st.markdown("#### 🧭 拼接顺序")
+            order_options = [f"{i+1}. {packet.name}" for i, packet in enumerate(packets)]
+            ordered_labels = st.multiselect(
+                "按拼接顺序选择图像（默认按上传顺序）",
+                options=order_options,
+                default=order_options,
+                help="请只保留当前区域内、希望参与牙齿主体拼接的图像，并按顺序排列。"
+            )
+            selected_indices = [order_options.index(label) for label in ordered_labels]
 
-        st.markdown("#### 🧭 拼接顺序")
-        order_options = [f"{i+1}. {packet.name}" for i, packet in enumerate(packets)]
-        ordered_labels = st.multiselect(
-            "按拼接顺序选择图像（默认按上传顺序）",
-            options=order_options,
-            default=order_options,
-            help="请只保留当前区域内、希望参与牙齿主体拼接的图像，并按顺序排列。"
-        )
-        selected_indices = [order_options.index(label) for label in ordered_labels]
-
-        if len(selected_indices) < 2:
-            st.warning("⚠️ 请选择至少 2 张图像参与拼接")
-            return
+            if len(selected_indices) < 2:
+                st.warning("⚠️ 请选择至少 2 张图像参与拼接；如果只想测试单张全景图，请只上传 1 张。")
+                _render_hunyuan_generation_panel(
+                    region_label=region_label,
+                    prepared_source=st.session_state.get("stitched_for_3d_image"),
+                    prepared_mask=st.session_state.get("stitched_for_3d_mask"),
+                )
+                return
 
         st.info(
             f"""
             **拼接说明**：
             - 当前区域：**{region_label}**
-            - 当前使用 **{feature_method.upper()}** 特征匹配方法
-            - 按你选择的顺序进行逐步拼接
+            - {"单张全景图模式：跳过特征匹配和拼接" if single_panorama_mode else f"当前使用 **{feature_method.upper()}** 特征匹配方法"}
+            - {"直接使用当前图像作为完整牙弓输入" if single_panorama_mode else "按你选择的顺序进行逐步拼接"}
             - 最终输出默认只保留牙齿主体区域
-            - 即使低质量图像也会尽量尝试拼接，但会标记可信度、fallback 和降级原因
+            - 即使低质量图像也会尽量输出结果，但会标记可信度、fallback 和降级原因
             """
         )
 
         col_stitch_btn, col_stitch_info = st.columns([1, 3])
         with col_stitch_btn:
-            run_stitching = st.button("开始拼接", type="primary", width="stretch")
+            run_stitching = st.button("使用单张全景图" if single_panorama_mode else "开始拼接", type="primary", width="stretch")
 
         if run_stitching:
-            with st.spinner("🔄 正在拼接牙齿主体..."):
+            spinner_text = "🔄 正在处理单张全景图..." if single_panorama_mode else "🔄 正在拼接牙齿主体..."
+            with st.spinner(spinner_text):
                 ordered_packets = [packets[i] for i in selected_indices]
                 images = [p.image for p in ordered_packets]
                 pipeline_seg_results = st.session_state.get("seg_results")
@@ -696,12 +1072,7 @@ def main() -> None:
                     enable_auto_calibration=enable_calibration  # 新增参数
                 )
                 st.session_state.stitch_outputs = outputs
-                st.session_state.pop("prepared_3d_asset", None)
-                st.session_state.pop("pseudo_multiview_pack", None)
-                st.session_state.pop("hunyuan_job_uid", None)
-                st.session_state.pop("hunyuan_job_status", None)
-                st.session_state.pop("hunyuan_job_message", None)
-                st.session_state.pop("hunyuan_job_result_bytes", None)
+                _reset_hunyuan_generation_state(clear_prepared_asset=True)
 
         outputs = st.session_state.get("stitch_outputs")
         if outputs is not None:
@@ -775,17 +1146,20 @@ def main() -> None:
 
                     # 显示拼接结果（去噪后或原始）
                     if confidence_level == "high":
-                        st.success("✅ 拼接完成，当前结果可信度较高")
+                        st.success("✅ 单张全景图处理完成，当前结果可信度较高" if quality_gate.get("single_image_panorama_mode") else "✅ 拼接完成，当前结果可信度较高")
                     elif confidence_level == "medium":
-                        st.warning("⚠️ 拼接完成，但当前结果为中等可信度，请重点检查边缘和重叠区域")
+                        st.warning("⚠️ 单张全景图已输出，但当前结果为中等可信度，请重点检查分割区域" if quality_gate.get("single_image_panorama_mode") else "⚠️ 拼接完成，但当前结果为中等可信度，请重点检查边缘和重叠区域")
                     else:
-                        st.warning("⚠️ 拼接已输出，但当前结果低可信，仅建议作为参考")
+                        st.warning("⚠️ 单张全景图已输出，但当前结果低可信，仅建议作为参考" if quality_gate.get("single_image_panorama_mode") else "⚠️ 拼接已输出，但当前结果低可信，仅建议作为参考")
 
                     if not strict_teeth_only:
                         st.caption("当前结果包含 fallback full mask 输入，因此属于 degraded teeth-only 输出。")
 
                     # 显示标签
-                    result_label = "去噪后的牙齿拼接图" if enable_noise_removal else "牙齿拼接图（未去噪）"
+                    if quality_gate.get("single_image_panorama_mode"):
+                        result_label = "去噪后的单张全景牙齿图" if enable_noise_removal else "单张全景牙齿图（未去噪）"
+                    else:
+                        result_label = "去噪后的牙齿拼接图" if enable_noise_removal else "牙齿拼接图（未去噪）"
                     st.image(bgr_to_rgb(stitched_to_display), caption=result_label, width="stretch")
                     st.session_state.stitched_for_3d_image = stitched_to_display.copy()
                     st.session_state.stitched_for_3d_mask = stitched_mask_for_3d.copy()
@@ -802,9 +1176,16 @@ def main() -> None:
 
                     with col_dl1:
                         # 下载最终结果（去噪后或原始）
-                        download_label = "⬇️ 下载去噪后拼接图" if enable_noise_removal else "⬇️ 下载牙齿拼接图"
+                        if quality_gate.get("single_image_panorama_mode"):
+                            download_label = "⬇️ 下载去噪后全景图" if enable_noise_removal else "⬇️ 下载单张全景图"
+                        else:
+                            download_label = "⬇️ 下载去噪后拼接图" if enable_noise_removal else "⬇️ 下载牙齿拼接图"
                         arch_slug = _slugify_arch_label(region_label)
                         filename = (
+                            f"panorama_teeth_cleaned_{arch_slug}.png"
+                            if quality_gate.get("single_image_panorama_mode") and enable_noise_removal else
+                            f"panorama_teeth_only_{arch_slug}.png"
+                            if quality_gate.get("single_image_panorama_mode") else
                             f"stitched_teeth_cleaned_{arch_slug}.png"
                             if enable_noise_removal else
                             f"stitched_teeth_only_{arch_slug}.png"
@@ -820,16 +1201,22 @@ def main() -> None:
                     with col_dl2:
                         # 如果启用了去噪，额外提供原始拼接图下载
                         if enable_noise_removal:
+                            original_label = "⬇️ 下载原始全景图（未去噪）" if quality_gate.get("single_image_panorama_mode") else "⬇️ 下载原始拼接图（未去噪）"
+                            original_prefix = "panorama_teeth_original" if quality_gate.get("single_image_panorama_mode") else "stitched_teeth_original"
                             st.download_button(
-                                "⬇️ 下载原始拼接图（未去噪）",
+                                original_label,
                                 data=_encode_png_bytes(outputs.stitched),
-                                file_name=f"stitched_teeth_original_{_slugify_arch_label(region_label)}.png",
+                                file_name=f"{original_prefix}_{_slugify_arch_label(region_label)}.png",
                                 mime="image/png",
                                 width="stretch",
                             )
 
-                st.markdown("#### 🔬 匹配可视化")
-                st.image(outputs.match_visualization, width="stretch")
+                if quality_gate.get("single_image_panorama_mode"):
+                    st.markdown("#### 🔬 单图输入预览")
+                    st.image(bgr_to_rgb(outputs.match_visualization), width="stretch")
+                else:
+                    st.markdown("#### 🔬 匹配可视化")
+                    st.image(outputs.match_visualization, width="stretch")
 
                 st.markdown("#### 📈 质量指标")
                 if outputs.diagnostics.per_image:
@@ -892,269 +1279,24 @@ def main() -> None:
                 st.caption(
                     f"分割来源: {diagnostic_payload.get('segmentation_source', 'pipeline_runtime')} | 输出模式: {diagnostic_payload.get('output_mode', 'unknown')}"
                 )
-
-            prepared_source = st.session_state.get("stitched_for_3d_image")
-            prepared_mask = st.session_state.get("stitched_for_3d_mask")
-            if prepared_source is not None and prepared_mask is not None:
-                st.divider()
-                st.markdown("### 🧊 第 3 步: Hunyuan3D Demo 输入准备")
-                st.info(
-                    """
-                    当前 3D Demo 先接入单张完整牙弓图的预处理链路：
-                    拼接结果 → 目标区域裁剪 → 方形画布归一化 → 3D-ready PNG。
-                    下一步我们会在这之上补 pseudo-multiview 和 Hunyuan3D-2mv 推理。
-                    """
-                )
-
-                service_config = HunyuanServiceConfig.from_env()
-                probe_button_col, probe_info_col = st.columns([1, 2])
-                with probe_button_col:
-                    if st.button("检测 Hunyuan3D 服务", key="probe_hunyuan3d_service", width="stretch"):
-                        probe_result = HunyuanServiceClient(service_config).probe()
-                        st.session_state.hunyuan_probe_result = probe_result
-                with probe_info_col:
-                    st.caption(
-                        f"服务地址: {service_config.service_url} | 模型: {service_config.model_path} | 子目录: {service_config.subfolder}"
-                    )
-
-                probe_result = st.session_state.get("hunyuan_probe_result")
-                if probe_result is not None:
-                    if probe_result.reachable:
-                        st.success(f"✅ Hunyuan3D 服务可访问：{probe_result.url}（状态：{probe_result.status}）")
-                    else:
-                        st.warning(f"⚠️ Hunyuan3D 服务暂不可访问：{probe_result.message}")
-
-                prep_btn_col, prep_info_col = st.columns([1, 2])
-                with prep_btn_col:
-                    if st.button("准备 3D 输入", key="prepare_hunyuan_input", type="secondary", width="stretch"):
-                        try:
-                            prepared_asset = prepare_image_for_hunyuan3d(
-                                prepared_source,
-                                mask=prepared_mask,
-                                target_size=512,
-                                padding_ratio=0.12,
-                            )
-                            st.session_state.prepared_3d_asset = prepared_asset
-                            st.session_state.pop("pseudo_multiview_pack", None)
-                            st.session_state.pop("hunyuan_job_uid", None)
-                            st.session_state.pop("hunyuan_job_status", None)
-                            st.session_state.pop("hunyuan_job_message", None)
-                            st.session_state.pop("hunyuan_job_result_bytes", None)
-                        except Exception as exc:
-                            st.error(f"❌ 3D 输入准备失败：{exc}")
-                with prep_info_col:
-                    meta = st.session_state.get("stitched_for_3d_meta", {})
-                    st.caption(
-                        "输入来源: "
-                        f"{meta.get('region_label', 'unknown')} | "
-                        f"可信度: {meta.get('confidence_level', 'unknown')} | "
-                        f"严格牙齿输出: {'是' if meta.get('strict_teeth_only', True) else '否'}"
-                    )
-
-                prepared_asset = st.session_state.get("prepared_3d_asset")
-                if prepared_asset is not None:
-                    col_src, col_ready = st.columns(2)
-                    with col_src:
-                        st.markdown("#### 原始 3D 来源图")
-                        st.image(bgr_to_rgb(resize_for_display(prepared_source)), width="stretch")
-                    with col_ready:
-                        st.markdown("#### 3D-ready 输入图")
-                        st.image(bgr_to_rgb(prepared_asset.bgr_image), width="stretch")
-
-                    st.markdown("#### 3D 输入元数据")
-                    st.dataframe(
-                        [{
-                            "原图尺寸": f"{prepared_asset.metadata['source_shape'][1]} x {prepared_asset.metadata['source_shape'][0]}",
-                            "输出尺寸": prepared_asset.metadata["target_size"],
-                            "原图覆盖率": f"{prepared_asset.metadata['source_mask_coverage']:.1%}",
-                            "输出覆盖率": f"{prepared_asset.metadata['prepared_mask_coverage']:.1%}",
-                            "裁剪框": ", ".join(map(str, prepared_asset.metadata["source_bbox_xyxy"])),
-                            "放置框": ", ".join(map(str, prepared_asset.metadata["placed_bbox_xyxy"])),
-                        }],
-                        width="stretch",
-                    )
-
-                    dl_col1, dl_col2, dl_col3 = st.columns(3)
-                    with dl_col1:
-                        st.download_button(
-                            "⬇️ 下载 3D-ready PNG",
-                            data=prepared_asset.png_bytes(transparent=False),
-                            file_name=f"hunyuan3d_input_{_slugify_arch_label(region_label)}.png",
-                            mime="image/png",
-                            width="stretch",
-                        )
-                    with dl_col2:
-                        st.download_button(
-                            "⬇️ 下载透明 PNG",
-                            data=prepared_asset.png_bytes(transparent=True),
-                            file_name=f"hunyuan3d_input_rgba_{_slugify_arch_label(region_label)}.png",
-                            mime="image/png",
-                            width="stretch",
-                        )
-                    with dl_col3:
-                        st.download_button(
-                            "⬇️ 下载预处理元数据",
-                            data=prepared_asset.metadata_bytes(),
-                            file_name=f"hunyuan3d_input_metadata_{_slugify_arch_label(region_label)}.json",
-                            mime="application/json",
-                            width="stretch",
-                        )
-
-                    st.markdown("#### Pseudo Multiview")
-                    mv_btn_col, mv_info_col = st.columns([1, 2])
-                    with mv_btn_col:
-                        if st.button("生成伪多视图", key="build_pseudo_multiview", type="secondary", width="stretch"):
-                            pseudo_pack = build_pseudo_multiview_pack(
-                                prepared_asset,
-                                include_back=False,
-                                side_strength=0.10,
-                            )
-                            st.session_state.pseudo_multiview_pack = pseudo_pack
-                            st.session_state.pop("hunyuan_job_uid", None)
-                            st.session_state.pop("hunyuan_job_status", None)
-                            st.session_state.pop("hunyuan_job_message", None)
-                            st.session_state.pop("hunyuan_job_result_bytes", None)
-                    with mv_info_col:
-                        st.caption(
-                            "当前默认生成 3 个视角：front / left / right。"
-                            "它们来自单张牙弓图的透视扰动，只用于 demo 条件输入。"
-                        )
-
-                    pseudo_pack = st.session_state.get("pseudo_multiview_pack")
-                    if pseudo_pack is not None:
-                        st.image(bgr_to_rgb(pseudo_pack.preview_grid()), caption="伪多视图预览", width="stretch")
-                        mv_dl1, mv_dl2 = st.columns(2)
-                        with mv_dl1:
-                            st.download_button(
-                                "⬇️ 下载伪多视图 ZIP",
-                                data=pseudo_pack.archive_bytes(transparent=False),
-                                file_name=f"pseudo_multiview_views_{_slugify_arch_label(region_label)}.zip",
-                                mime="application/zip",
-                                width="stretch",
-                            )
-                        with mv_dl2:
-                            st.download_button(
-                                "⬇️ 下载透明伪多视图 ZIP",
-                                data=pseudo_pack.archive_bytes(transparent=True),
-                                file_name=f"pseudo_multiview_views_rgba_{_slugify_arch_label(region_label)}.zip",
-                                mime="application/zip",
-                                width="stretch",
-                            )
-
-                        st.markdown("#### Hunyuan3D-2mv 提交")
-                        current_job_uid = st.session_state.get("hunyuan_job_uid")
-                        current_job_status = st.session_state.get("hunyuan_job_status")
-                        current_job_message = st.session_state.get("hunyuan_job_message")
-                        result_bytes = st.session_state.get("hunyuan_job_result_bytes")
-
-                        should_autopoll = bool(current_job_uid) and not result_bytes and current_job_status not in {"completed", "error"}
-                        if should_autopoll:
-                            st_autorefresh(interval=5000, key="hunyuan_mv_job_autorefresh")
-                            try:
-                                client = HunyuanServiceClient(service_config)
-                                job_status = client.get_job_status(current_job_uid)
-                                st.session_state.hunyuan_job_status = job_status.status
-                                if job_status.model_bytes:
-                                    arch_slug = _slugify_arch_label(region_label)
-                                    st.session_state.hunyuan_job_result_bytes = job_status.model_bytes
-                                    st.session_state.hunyuan_job_result_path = str(
-                                        _persist_hunyuan_result(current_job_uid, job_status.model_bytes, arch_slug=arch_slug)
-                                    )
-                                if job_status.message:
-                                    st.session_state.hunyuan_job_message = job_status.message
-                                current_job_status = job_status.status
-                                current_job_message = job_status.message
-                                result_bytes = job_status.model_bytes or result_bytes
-                            except Exception as exc:
-                                st.warning(f"自动轮询 3D 任务状态失败：{exc}")
-
-                        submit_col, refresh_col = st.columns(2)
-                        submit_disabled = bool(current_job_uid) and current_job_status not in {None, "completed", "error"}
-                        with submit_col:
-                            if st.button("提交到 Hunyuan3D-2mv", key="submit_hunyuan_mv", type="primary", width="stretch", disabled=submit_disabled):
-                                try:
-                                    client = HunyuanServiceClient(service_config)
-                                    job_uid = client.submit_multiview_async(
-                                        pseudo_pack.payload_images(transparent=True),
-                                        seed=1234,
-                                        num_inference_steps=_default_hunyuan_steps(service_config.subfolder),
-                                        guidance_scale=5.0,
-                                        octree_resolution=256,
-                                        texture=False,
-                                    )
-                                    st.session_state.hunyuan_job_uid = job_uid
-                                    st.session_state.hunyuan_job_status = "submitted"
-                                    st.session_state.hunyuan_job_message = None
-                                    st.session_state.hunyuan_job_result_bytes = None
-                                    st.session_state.hunyuan_job_result_path = None
-                                except Exception as exc:
-                                    st.error(f"❌ 提交 Hunyuan3D-2mv 任务失败：{exc}")
-                        with refresh_col:
-                            if st.button("刷新 3D 任务状态", key="refresh_hunyuan_mv_status", width="stretch"):
-                                job_uid = st.session_state.get("hunyuan_job_uid")
-                                if not job_uid:
-                                    st.warning("⚠️ 当前没有待查询的 3D 任务。")
-                                else:
-                                    try:
-                                        client = HunyuanServiceClient(service_config)
-                                        job_status = client.get_job_status(job_uid)
-                                        st.session_state.hunyuan_job_status = job_status.status
-                                        if job_status.model_bytes:
-                                            arch_slug = _slugify_arch_label(region_label)
-                                            st.session_state.hunyuan_job_result_bytes = job_status.model_bytes
-                                            st.session_state.hunyuan_job_result_path = str(
-                                                _persist_hunyuan_result(job_uid, job_status.model_bytes, arch_slug=arch_slug)
-                                            )
-                                        if job_status.message:
-                                            st.session_state.hunyuan_job_message = job_status.message
-                                    except Exception as exc:
-                                        st.error(f"❌ 查询 Hunyuan3D-2mv 状态失败：{exc}")
-
-                        current_job_uid = st.session_state.get("hunyuan_job_uid")
-                        current_job_status = st.session_state.get("hunyuan_job_status")
-                        current_job_message = st.session_state.get("hunyuan_job_message")
-                        current_job_result_path = st.session_state.get("hunyuan_job_result_path")
-                        if current_job_uid:
-                            st.caption(
-                                f"当前任务 UID: {current_job_uid} | 状态: {current_job_status or 'submitted'}"
-                            )
-                        if submit_disabled:
-                            st.caption("当前 3D 服务一次只处理一个任务，请等待本次任务完成或失败后再提交新的任务。")
-                        if should_autopoll:
-                            st.info("任务进行中，页面会每 5 秒自动轮询一次。")
-                        if current_job_status == "error" and current_job_message:
-                            st.error(f"❌ Hunyuan3D-2mv 任务失败：{current_job_message}")
-
-                        result_bytes = st.session_state.get("hunyuan_job_result_bytes")
-                        if not result_bytes and current_job_result_path:
-                            result_path_obj = Path(current_job_result_path)
-                            if result_path_obj.exists():
-                                result_bytes = result_path_obj.read_bytes()
-                                st.session_state.hunyuan_job_result_bytes = result_bytes
-                        if result_bytes:
-                            st.success("✅ 已收到 Hunyuan3D-2mv 输出 mesh。")
-                            if current_job_result_path:
-                                st.caption(f"结果已保存到: {current_job_result_path}")
-                            st.markdown("#### GLB 在线预览")
-                            _render_glb_preview(result_bytes)
-                            st.download_button(
-                                "⬇️ 下载 3D Mesh (GLB)",
-                                data=result_bytes,
-                                file_name=f"hunyuan3d_demo_{_slugify_arch_label(region_label)}.glb",
-                                mime="model/gltf-binary",
-                                width="stretch",
-                            )
     else:
         st.info("👆 点击上方「执行分割」按钮开始处理")
+
+    _render_hunyuan_generation_panel(
+        region_label=region_label,
+        prepared_source=st.session_state.get("stitched_for_3d_image"),
+        prepared_mask=st.session_state.get("stitched_for_3d_mask"),
+    )
 
     st.divider()
     st.caption(
         """
         **使用提示**：
-        1. 上传同一牙弓、同一侧段的口腔内窥镜图像
+        1. 上传同一牙弓、同一侧段的口腔内窥镜图像；如果只上传 1 张，则默认它是完整全景图
         2. 点击「执行分割」查看分割效果
-        3. 确认分割效果满意后，点击「开始拼接」
-        4. 下载牙齿主体拼接结果和诊断报告
+        3. 确认分割效果满意后，多图点击「开始拼接」，单图点击「使用单张全景图」
+        4. 在第 3 步里可以直接把当前全景图送进 Hunyuan3D-2.1，或手动上传一张牙齿全景图
+        5. 下载牙齿主体结果、3D-ready 输入图和生成后的 GLB
         """
     )
 

@@ -36,7 +36,7 @@ def run_pipeline(
 ) -> StitchOutputs:
     logs: list[str] = []
 
-    if len(images) < 2:
+    if len(images) == 0:
         diagnostics = StitchDiagnostics(
             pipeline_version=PIPELINE_VERSION,
             segmentation=StepDiagnostics(False, {"reason": "insufficient_images"}),
@@ -44,7 +44,7 @@ def run_pipeline(
             registration=StepDiagnostics(False, {"reason": "insufficient_images"}),
             blending=StepDiagnostics(False, {"reason": "insufficient_images"}),
             output_mode=OUTPUT_MODE,
-            logs=["Need at least two images."],
+            logs=["Need at least one image."],
         )
         placeholder = images[0] if images else np.zeros((100, 100, 3), dtype=np.uint8)
         return StitchOutputs(
@@ -149,6 +149,17 @@ def run_pipeline(
     extracted_images = [_extract_teeth_image(img, seg.mask) for img, seg in zip(normalized, prepared_seg_results)]
     mask_overlay = [seg.overlay for seg in prepared_seg_results]
 
+    if len(normalized) == 1:
+        return _run_single_image_pipeline(
+            images=normalized,
+            extracted_images=extracted_images,
+            seg_results=prepared_seg_results,
+            metrics=metrics,
+            segmentation_source=segmentation_source,
+            logs=logs,
+            mask_overlay=mask_overlay,
+        )
+
     if len(normalized) == 2:
         return _run_pair_pipeline(
             images=normalized,
@@ -171,6 +182,71 @@ def run_pipeline(
         segmentation_source=segmentation_source,
         logs=logs,
         mask_overlay=mask_overlay,
+    )
+
+
+def _run_single_image_pipeline(
+    images: list[np.ndarray],
+    extracted_images: list[np.ndarray],
+    seg_results: list[SegmentationResult],
+    metrics: list[tuple[float, float]],
+    segmentation_source: str,
+    logs: list[str],
+    mask_overlay: list[np.ndarray],
+) -> StitchOutputs:
+    per_image = _build_per_image_diagnostics(seg_results, metrics, segmentation_source)
+    seg_result = seg_results[0]
+    stitched = extracted_images[0]
+    stitched_mask = seg_result.mask.copy()
+    mask_coverage = float(cv2.countNonZero(stitched_mask) / stitched_mask.size) if stitched_mask.size else 0.0
+    used_fallback_mask = bool(per_image[0].get("used_fallback_mask"))
+
+    quality_gate = {
+        "gate_passed": True,
+        "confidence_level": "medium" if used_fallback_mask else "high",
+        "single_image_panorama_mode": True,
+        "accepted_indices": [0],
+        "skipped_indices": [],
+        "fail_reasons": [],
+        "degrade_reasons": ["segmentation_fallback_mask"] if used_fallback_mask else [],
+        "stitched_mask_coverage": mask_coverage,
+        "mask_overlap_ratio": 1.0,
+        "match_count": 0,
+        "inlier_count": 0,
+        "inlier_ratio": 0.0,
+        "reprojection_error": 0.0,
+        "warp_area_ratio": 1.0,
+        "warp_canvas_ratio": 1.0,
+        "warp_perspective_strength": 0.0,
+        "region_mode": "single_image_panorama",
+        "output_mode": OUTPUT_MODE,
+        "strict_teeth_only": not used_fallback_mask,
+    }
+
+    diagnostics = StitchDiagnostics(
+        pipeline_version=PIPELINE_VERSION,
+        segmentation=StepDiagnostics(True, {"method": seg_result.method, "count": 1, "output_mode": OUTPUT_MODE}),
+        features=StepDiagnostics(True, {"method": "single_image_passthrough", "match_count": 0}),
+        registration=StepDiagnostics(True, {"method": "identity", "reason": "single_image_panorama"}),
+        blending=StepDiagnostics(True, {"method": "single_image_passthrough", "output_mode": OUTPUT_MODE}),
+        segmentation_source=segmentation_source,
+        output_mode=OUTPUT_MODE,
+        quality_gate=quality_gate,
+        metrics={
+            "inputs": [{"sharpness": m[0], "exposure": m[1]} for m in metrics],
+            "sequence_mode": "single_image_panorama",
+        },
+        per_image=per_image,
+        per_pair=[],
+        logs=logs + ["Single image panorama mode: stitching skipped."],
+    )
+
+    return StitchOutputs(
+        stitched=stitched,
+        stitched_mask=stitched_mask,
+        diagnostics=diagnostics,
+        mask_overlay=mask_overlay,
+        match_visualization=images[0],
     )
 
 

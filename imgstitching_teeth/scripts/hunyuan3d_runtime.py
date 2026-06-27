@@ -22,7 +22,7 @@ RUNTIME_DIR = ROOT_DIR / ".runtime" / "hunyuan3d"
 LOG_DIR = RUNTIME_DIR / "logs"
 REPO_DIR = ROOT_DIR / "third_party" / "Hunyuan3D-2"
 MODELS_DIR = RUNTIME_DIR / "models"
-MODEL_DIR = MODELS_DIR / "Hunyuan3D-2mv"
+MODEL_DIR = MODELS_DIR / "Hunyuan3D-2.1"
 INSTALL_STAMP_PATH = RUNTIME_DIR / "install.ok"
 SERVICE_PID_PATH = RUNTIME_DIR / "service.pid"
 SERVICE_LOG_PATH = LOG_DIR / "service.log"
@@ -87,7 +87,7 @@ def setup_runtime() -> None:
     _patch_shapegen_init_for_optional_postprocessors()
 
     print(f"[{_now()}] Step 2/3: 安装 Hunyuan3D 兼容运行依赖到当前 Python 环境")
-    print(f"[{_now()}] 当前模式: shape-only + multiview bridge（跳过 pymeshlab / xatlas / rembg / onnxruntime）")
+    print(f"[{_now()}] 当前模式: Hunyuan3D-2.1 单图 shape-only bridge（跳过纹理和重型可选组件）")
     python = sys.executable
     _run([python, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
     _run([python, "-m", "pip", "install", *MINIMAL_RUNTIME_REQUIREMENTS])
@@ -97,7 +97,7 @@ def setup_runtime() -> None:
         (
             f"installed_at={datetime.now().isoformat()}\n"
             f"python={python}\n"
-            "profile=shape_only_mv_bridge\n"
+            "profile=shape_only_single_image_bridge\n"
         ),
         encoding="utf-8",
     )
@@ -105,21 +105,22 @@ def setup_runtime() -> None:
 
 
 def download_model() -> None:
-    subfolder = str(ENV_CONFIG.get("HUNYUAN3D_SUBFOLDER", "hunyuan3d-dit-v2-mv-turbo"))
-    print(f"[{_now()}] 开始下载 Hunyuan3D-2mv 模型到 {MODEL_DIR}")
+    subfolder = str(ENV_CONFIG.get("HUNYUAN3D_SUBFOLDER", "hunyuan3d-dit-v2-1"))
+    print(f"[{_now()}] 开始下载 Hunyuan3D-2.1 模型到 {MODEL_DIR}")
     print(f"[{_now()}] 目标子目录: {subfolder}")
     _cleanup_partial_model_downloads(subfolder)
-    target_filename = "model.fp16.safetensors" if "turbo" in subfolder or "fast" in subfolder else "model.safetensors"
+    target_filename = "model.fp16.ckpt" if subfolder == "hunyuan3d-dit-v2-1" else (
+        "model.fp16.safetensors" if "turbo" in subfolder or "fast" in subfolder else "model.safetensors"
+    )
     target_dir = MODEL_DIR / subfolder
     target_dir.mkdir(parents=True, exist_ok=True)
 
     files_to_download = [
-        (f"https://huggingface.co/tencent/Hunyuan3D-2mv/resolve/main/{subfolder}/config.yaml", target_dir / "config.yaml"),
-        (f"https://huggingface.co/tencent/Hunyuan3D-2mv/resolve/main/{subfolder}/{target_filename}", target_dir / target_filename),
-        ("https://huggingface.co/tencent/Hunyuan3D-2mv/resolve/main/config.json", MODEL_DIR / "config.json"),
-        ("https://huggingface.co/tencent/Hunyuan3D-2mv/resolve/main/README.md", MODEL_DIR / "README.md"),
-        ("https://huggingface.co/tencent/Hunyuan3D-2mv/resolve/main/LICENSE", MODEL_DIR / "LICENSE"),
-        ("https://huggingface.co/tencent/Hunyuan3D-2mv/resolve/main/NOTICE", MODEL_DIR / "NOTICE"),
+        (f"https://huggingface.co/tencent/Hunyuan3D-2.1/resolve/main/{subfolder}/config.yaml", target_dir / "config.yaml"),
+        (f"https://huggingface.co/tencent/Hunyuan3D-2.1/resolve/main/{subfolder}/{target_filename}", target_dir / target_filename),
+        ("https://huggingface.co/tencent/Hunyuan3D-2.1/resolve/main/README.md", MODEL_DIR / "README.md"),
+        ("https://huggingface.co/tencent/Hunyuan3D-2.1/resolve/main/LICENSE", MODEL_DIR / "LICENSE"),
+        ("https://huggingface.co/tencent/Hunyuan3D-2.1/resolve/main/Notice.txt", MODEL_DIR / "Notice.txt"),
     ]
 
     for url, path in files_to_download:
@@ -129,7 +130,7 @@ def download_model() -> None:
 
 
 def start_service() -> None:
-    print(f"[{_now()}] 准备启动本地 Hunyuan3D bridge 服务")
+    print(f"[{_now()}] 准备启动本地 Hunyuan3D 单图 bridge 服务")
     existing_pid = _read_pid(SERVICE_PID_PATH)
     if _is_pid_alive(existing_pid):
         print(f"[{_now()}] 服务已在运行，PID={existing_pid}")
@@ -139,11 +140,15 @@ def start_service() -> None:
     host = str(ENV_CONFIG.get("HUNYUAN3D_SERVICE_HOST", "127.0.0.1"))
     port = str(ENV_CONFIG.get("HUNYUAN3D_SERVICE_PORT", "8081"))
     device = _resolve_device(str(ENV_CONFIG.get("HUNYUAN3D_DEVICE", "auto")))
-    subfolder = str(ENV_CONFIG.get("HUNYUAN3D_SUBFOLDER", "hunyuan3d-dit-v2-mv-turbo"))
+    subfolder = str(ENV_CONFIG.get("HUNYUAN3D_SUBFOLDER", "hunyuan3d-dit-v2-1"))
     keepalive_seconds = _resolve_keepalive_seconds(device)
-    model_path = str(MODEL_DIR if MODEL_DIR.exists() else ENV_CONFIG.get("HUNYUAN3D_MODEL_PATH", "tencent/Hunyuan3D-2mv"))
-    model_file = MODEL_DIR / subfolder / ("model.fp16.safetensors" if "turbo" in subfolder or "fast" in subfolder else "model.safetensors")
-    model_ckpt = MODEL_DIR / subfolder / ("model.fp16.ckpt" if "turbo" in subfolder or "fast" in subfolder else "model.ckpt")
+    model_path = str(MODEL_DIR if MODEL_DIR.exists() else ENV_CONFIG.get("HUNYUAN3D_MODEL_PATH", "tencent/Hunyuan3D-2.1"))
+    if subfolder == "hunyuan3d-dit-v2-1":
+        model_file = MODEL_DIR / subfolder / "model.fp16.ckpt"
+        model_ckpt = model_file
+    else:
+        model_file = MODEL_DIR / subfolder / ("model.fp16.safetensors" if "turbo" in subfolder or "fast" in subfolder else "model.safetensors")
+        model_ckpt = MODEL_DIR / subfolder / ("model.fp16.ckpt" if "turbo" in subfolder or "fast" in subfolder else "model.ckpt")
     if not model_file.exists() and not model_ckpt.exists():
         raise FileNotFoundError(
             f"模型权重未找到：{model_file}。请先执行 download-model 或一键下载并启动。"
@@ -169,7 +174,7 @@ def start_service() -> None:
         "--keepalive-seconds",
         str(keepalive_seconds),
     ]
-    if device.startswith("cuda"):
+    if _should_enable_flashvdm(subfolder, device):
         command.append("--enable_flashvdm")
 
     with SERVICE_LOG_PATH.open("w", encoding="utf-8") as log_file:
@@ -332,6 +337,12 @@ def _resolve_keepalive_seconds(device: str) -> float:
     if device == "mps":
         return 0.0
     return 900.0
+
+
+def _should_enable_flashvdm(subfolder: str, device: str) -> bool:
+    if not device.startswith("cuda"):
+        return False
+    return subfolder != "hunyuan3d-dit-v2-1"
 
 
 def _patch_shapegen_init_for_optional_postprocessors() -> None:
